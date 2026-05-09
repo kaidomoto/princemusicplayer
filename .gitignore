@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output
+client/dist/
+
+# Sensitive credentials & secrets
+data/accounts.json
+data/accounts.json.bak
+data/*.bak
+.auth/
+*.pem
+*.key
+client_secret*.json
+get_refresh_token*.py
+get_spotify_refresh_token.py
+SPOTIFY_ENV_CONFIG.txt
+
+# Databases (runtime state, not source)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+
+# PM2
+.pm2/
+
+# Temporary scripts
+_*_tmp.js
+uid0_test.js
+
+# Memory data (user-specific runtime data)
+memory_data/

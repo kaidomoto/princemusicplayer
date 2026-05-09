@@ -1,0 +1,851 @@
+import React, { useState, useContext, useEffect, useRef } from 'react';
+import { SocketContext } from '../App';
+import clsx from 'clsx';
+import axios from 'axios';
+import {
+    Lock, Settings, Eye, Download, Trash2, RotateCcw, Music2, KeyRound, ChevronDown
+, Shuffle } from 'lucide-react';
+import VoiceSlots from '../components/VoiceSlots';
+
+// Sub-component for individual voice stream playback
+// Accepts shared audioContext + voiceGainNode for voice boost
+function VoicePlayer({ slotId, addLog, voiceAudioContext, voiceGainNode }) {
+    const audioRef = useRef(new Audio());
+    const mediaSourceRef = useRef(null);
+    const sourceBufferRef = useRef(null);
+    const queue = useRef([]);
+    const isProcessing = useRef(false);
+    const activeType = useRef(null);
+    const isMounted = useRef(true);
+    const hasInit = useRef(false);
+    const voiceSourceRef = useRef(null);
+
+    useEffect(() => {
+        isMounted.current = true;
+        hasInit.current = false;
+        const audio = audioRef.current;
+        audio.volume = 1.0;
+
+        // Connect voice audio to boost gain node if available
+        if (voiceAudioContext && voiceGainNode && !voiceSourceRef.current) {
+            try {
+                voiceSourceRef.current = voiceAudioContext.createMediaElementSource(audio);
+                voiceSourceRef.current.connect(voiceGainNode);
+                addLog(`[Slot ${slotId}] Voice connected to boost gain (${voiceGainNode.gain.value}x)`);
+            } catch (e) {
+                addLog(`[Slot ${slotId}] Voice gain connect err: ${e.message}`);
+            }
+        }
+
+        const handler = (e) => {
+            if (!isMounted.current) return;
+            const { buffer, type, header, isHeader } = e.detail;
+            addLog(`[Slot ${slotId}] Rx Chunk sz=${buffer.byteLength} type=${type} isH=${isHeader}`);
+
+            let finalType = type;
+            if (type === 'audio/mp4') finalType = 'audio/mp4; codecs="mp4a.40.2"';
+
+            if (!hasInit.current) {
+                if (isHeader) {
+                    queue.current.push({ buffer, type: finalType });
+                    hasInit.current = true;
+                } else if (header) {
+                    queue.current.push({ buffer: header, type: finalType });
+                    queue.current.push({ buffer, type: finalType });
+                    hasInit.current = true;
+                } else {
+                    addLog(`[Slot ${slotId}] WARN: Discarding packet missing header`);
+                    return;
+                }
+            } else {
+                queue.current.push({ buffer, type: finalType });
+            }
+            processQueue();
+        };
+
+        const processQueue = async () => {
+            if (isProcessing.current || !isMounted.current) return;
+            if (queue.current.length === 0) return;
+
+            const { buffer, type } = queue.current[0];
+            let ms = mediaSourceRef.current;
+
+            if (!ms || ms.readyState === 'closed') {
+                isProcessing.current = true;
+                ms = new MediaSource();
+                mediaSourceRef.current = ms;
+                audio.src = URL.createObjectURL(ms);
+                addLog(`[Slot ${slotId}] Init MediaSource`);
+                try {
+                    await new Promise((resolve, reject) => {
+                        const onOpen = () => resolve();
+                        const onClose = () => reject('closed');
+                        ms.addEventListener('sourceopen', onOpen, { once: true });
+                        ms.addEventListener('sourceclose', onClose, { once: true });
+                        setTimeout(() => {
+                            ms.removeEventListener('sourceopen', onOpen);
+                            ms.removeEventListener('sourceclose', onClose);
+                            reject('timeout');
+                        }, 500);
+                    });
+                } catch (e) {
+                    addLog(`[Slot ${slotId}] MS Init Error: ${e}`);
+                    isProcessing.current = false;
+                    return;
+                }
+            }
+
+            if (!isMounted.current) { isProcessing.current = false; return; }
+
+            if (!sourceBufferRef.current || activeType.current !== type) {
+                isProcessing.current = true;
+                if (sourceBufferRef.current) {
+                    try { if (ms.readyState === 'open') ms.removeSourceBuffer(sourceBufferRef.current); } catch { }
+                }
+                try {
+                    if (ms.readyState !== 'open') throw new Error('MS not open');
+                    const sb = ms.addSourceBuffer(type);
+                    sb.mode = 'sequence';
+                    sb.addEventListener('updateend', () => {
+                        isProcessing.current = false;
+                        processQueue();
+                    });
+                    sb.addEventListener('error', (e) => addLog(`[Slot ${slotId}] SB Error: ${e}`));
+                    sourceBufferRef.current = sb;
+                    activeType.current = type;
+                    addLog(`[Slot ${slotId}] Added SB: ${type}`);
+                } catch (e) {
+                    addLog(`[Slot ${slotId}] Add SB Failed: ${e.message}`);
+                    queue.current.shift();
+                    isProcessing.current = false;
+                    return;
+                }
+            }
+
+            if (!isMounted.current) { isProcessing.current = false; return; }
+
+            const sb = sourceBufferRef.current;
+            if (!sb) { isProcessing.current = false; return; }
+            if (sb.updating) { isProcessing.current = true; return; }
+
+            try {
+                const item = queue.current.shift();
+                isProcessing.current = true;
+                let data = item.buffer;
+                if (data instanceof Blob) data = await data.arrayBuffer();
+
+                if (ms.readyState === 'open' && isMounted.current) {
+                    sb.appendBuffer(data);
+                    if (audio.paused) {
+                        audio.play().catch(() => { });
+                    }
+                    // Latency chase: if buffer end is too far ahead, seek forward
+                    if (audio.buffered.length > 0) {
+                        const buffEnd = audio.buffered.end(audio.buffered.length - 1);
+                        const lag = buffEnd - audio.currentTime;
+                        if (lag > 1.5) {
+                            audio.currentTime = buffEnd - 0.3;
+                        }
+                    }
+                }
+            } catch (e) {
+                addLog(`[Slot ${slotId}] Append Error: ${e.message}`);
+                isProcessing.current = false;
+            }
+        };
+
+        window.addEventListener(`voice_data_${slotId}`, handler);
+        return () => {
+            isMounted.current = false;
+            window.removeEventListener(`voice_data_${slotId}`, handler);
+            if (mediaSourceRef.current && mediaSourceRef.current.readyState === 'open') {
+                try { mediaSourceRef.current.endOfStream(); } catch { }
+            }
+            audio.pause();
+            audio.src = '';
+        };
+    }, [slotId]);
+
+    return null;
+}
+
+// Admin Modal
+function AdminModal({ title, onClose, onConfirm }) {
+    const [val, setVal] = useState('');
+    return (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-[100] animate-in">
+            <div className="glass-panel p-5 rounded-2xl w-80 max-w-[90vw]">
+                <h3 className="font-hand text-prince-gold mb-3">{title}</h3>
+                <textarea
+                    className="w-full h-28 bg-prince-deep/80 border border-prince-gold/10 rounded-lg p-2 text-xs font-mono text-prince-cream focus:border-prince-gold outline-none scroll-allowed"
+                    value={val}
+                    onChange={e => setVal(e.target.value)}
+                    placeholder="Enter content..."
+                />
+                <div className="flex gap-2 mt-3">
+                    <button onClick={onClose} className="flex-1 py-2 text-xs text-prince-muted">取消</button>
+                    <button onClick={() => onConfirm(val)} className="flex-1 py-2 text-xs btn-prince">确认</button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// Change Password Modal
+function ChangePasswordModal({ type, label, onClose }) {
+    const [oldPwd, setOldPwd] = useState('');
+    const [newPwd, setNewPwd] = useState('');
+    const [confirmPwd, setConfirmPwd] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [success, setSuccess] = useState(false);
+
+    const handleSubmit = async () => {
+        setError('');
+        if (!oldPwd || !newPwd) { setError('请填写所有字段'); return; }
+        if (newPwd !== confirmPwd) { setError('两次输入的新密码不一致'); return; }
+        if (newPwd.length < 1) { setError('新密码不能为空'); return; }
+
+        setLoading(true);
+        try {
+            const token = sessionStorage.getItem('auth_player');
+            const headers = { 'x-auth-token': token || '' };
+            const res = await axios.post('/96/api/auth/change-password', {
+                type, oldPassword: oldPwd, newPassword: newPwd
+            }, { headers });
+            if (res.data.status === 'ok') {
+                // If changing lyrics, also sync slots password (they share the same credential)
+                if (type === 'lyrics') {
+                    try {
+                        await axios.post('/96/api/auth/change-password', {
+                            type: 'slots', oldPassword: oldPwd, newPassword: newPwd
+                        }, { headers });
+                    } catch { /* slots might not exist yet, ignore */ }
+                }
+                setSuccess(true);
+                setTimeout(() => onClose(), 1500);
+            }
+        } catch (e) {
+            setError(e.response?.data?.error || '修改失败');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-[100] animate-in">
+            <div className="glass-panel p-5 rounded-2xl w-80 max-w-[90vw]">
+                <h3 className="font-hand text-prince-gold mb-1 flex items-center gap-2">
+                    <KeyRound size={18} /> 修改{label}密码
+                </h3>
+                <p className="text-prince-muted text-xs mb-4">类型：{type}</p>
+
+                {success ? (
+                    <div className="text-center py-6">
+                        <div className="text-3xl mb-2">✅</div>
+                        <p className="text-prince-gold font-hand">密码已修改！</p>
+                    </div>
+                ) : (
+                    <>
+                        <input
+                            type="password" placeholder="旧密码" value={oldPwd}
+                            onChange={e => setOldPwd(e.target.value)}
+                            className="w-full mb-2 bg-prince-deep/80 border border-prince-gold/10 rounded-lg px-3 py-2 text-sm text-prince-cream focus:border-prince-gold outline-none"
+                        />
+                        <input
+                            type="password" placeholder="新密码" value={newPwd}
+                            onChange={e => setNewPwd(e.target.value)}
+                            className="w-full mb-2 bg-prince-deep/80 border border-prince-gold/10 rounded-lg px-3 py-2 text-sm text-prince-cream focus:border-prince-gold outline-none"
+                        />
+                        <input
+                            type="password" placeholder="确认新密码" value={confirmPwd}
+                            onChange={e => setConfirmPwd(e.target.value)}
+                            className="w-full mb-3 bg-prince-deep/80 border border-prince-gold/10 rounded-lg px-3 py-2 text-sm text-prince-cream focus:border-prince-gold outline-none"
+                        />
+                        {error && <p className="text-prince-rose text-xs mb-2">❌ {error}</p>}
+                        <div className="flex gap-2">
+                            <button onClick={onClose} className="flex-1 py-2 text-xs text-prince-muted">取消</button>
+                            <button onClick={handleSubmit} disabled={loading}
+                                className="flex-1 py-2 text-xs btn-prince disabled:opacity-50">
+                                {loading ? '修改中...' : '确认修改'}
+                            </button>
+                        </div>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+
+export default function Player() {
+    const socket = useContext(SocketContext);
+    // Only play audio in headless Chrome (mode=player URL param)
+    const isHeadlessPlayer = new URLSearchParams(window.location.search).get('mode') === 'player';
+
+    const audioRef = useRef(null);
+    const audioContextRef = useRef(null);
+    const sourceRef = useRef(null);
+    const gainNodeRef = useRef(null);      // User gain (BOOST slider)
+    const duckGainRef = useRef(null);       // Ducking gain (auto voice attenuation)
+    const voiceGainNodeRef = useRef(null);  // Voice boost gain node
+
+    const [state, setState] = useState({
+        playing: false, currentTrack: null, volume: 1,
+        currentTime: 0, duration: 0, loopMode: 'list', gain: 1
+    });
+    const stateRef = useRef(state);
+    useEffect(() => { stateRef.current = state; }, [state]);
+
+    const [data, setData] = useState({ playlists: [], songs: [] });
+    const [selectedPlaylistId, setSelectedPlaylistId] = useState(null);
+    const [manualActivated, setManualActivated] = useState(false);
+    const [audioContextReady, setAudioContextReady] = useState(false);
+    const [showAdminModal, setShowAdminModal] = useState(null);
+    const [showHidden, setShowHidden] = useState(false);
+    const [showDebug, setShowDebug] = useState(false);
+    const [logs, setLogs] = useState([]);
+    const [activeVoiceSlots, setActiveVoiceSlots] = useState({});
+    const [isVoiceActive, setIsVoiceActive] = useState(false);
+    const [showPwdMenu, setShowPwdMenu] = useState(false);
+    const [showVoiceSlots, setShowVoiceSlots] = useState(false);
+    const pwdMenuRef = useRef(null);
+
+    const addLog = (msg) => {
+        console.log('[Player]', msg);
+        setLogs(prev => [...prev.slice(-100), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    };
+
+    const initAudioContext = (manual) => {
+        if (!audioContextRef.current) {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            audioContextRef.current = ctx;
+
+            // Chain: source → duckGain → userGain → destination
+            const duckGain = ctx.createGain();
+            duckGain.gain.value = 1.0;
+            duckGainRef.current = duckGain;
+
+            const userGain = ctx.createGain();
+            userGain.gain.value = 1.0;
+            gainNodeRef.current = userGain;
+
+            duckGain.connect(userGain);
+            userGain.connect(ctx.destination);
+
+            // Voice boost: separate gain node for voice playback
+            const voiceGain = ctx.createGain();
+            voiceGain.gain.value = 3.0;  // 3x boost for voice
+            voiceGain.connect(ctx.destination);
+            voiceGainNodeRef.current = voiceGain;
+
+            addLog('Audio chain: source → duckGain → userGain → dest | voiceGain(3x) → dest');
+        }
+        if (audioContextRef.current.state === 'suspended') {
+            audioContextRef.current.resume();
+        }
+        setAudioContextReady(true);
+        if (manual) setManualActivated(true);
+
+        // Connect source if audio exists
+        if (audioRef.current && !sourceRef.current) {
+            try {
+                sourceRef.current = audioContextRef.current.createMediaElementSource(audioRef.current);
+                sourceRef.current.connect(duckGainRef.current);
+                addLog('Audio source connected to duckGain → userGain → dest');
+            } catch (e) { addLog(`Source connect error: ${e.message}`); }
+        }
+    };
+
+    // Handle player_action events (for load commands from server)
+    useEffect(() => {
+        if (!socket) return;
+
+        const handlePlayerAction = (action) => {
+            const audio = audioRef.current;
+            if (!audio) return;
+            const type = action.type;
+            const payload = action.payload;
+            addLog(`[RemoteCmd] ${type}: ${typeof payload === 'object' ? JSON.stringify(payload)?.slice(0,60) : payload || ''}`);
+
+            switch (type) {
+                case 'load':
+                    if (payload?.url && isHeadlessPlayer) {
+                        const a = audioRef.current;
+                        if (!a) { console.log('[Headless] No audio element yet'); break; }
+                        if (audioContextRef.current?.state === 'suspended') audioContextRef.current.resume();
+                        a.src = payload.url;
+                        a.load();
+                        setTimeout(() => {
+                            a.play().then(() => console.log('[Headless] Playing:', payload.url?.slice(-30)))
+                              .catch(e => console.log('[Headless] play error:', e.message));
+                        }, 500);
+                        addLog(`[RemoteCmd] Loaded: ${payload.title || payload.url}`);
+                    }
+                    break;
+                case 'play':
+                    if (!isHeadlessPlayer) break;
+                    addLog(`[RemoteCmd] Play requested, src=${audio.src ? 'yes' : 'NO'}, paused=${audio.paused}`);
+                    if (audio.src) {
+                        audio.play().then(() => {
+                            addLog(`[RemoteCmd] ▶️ Playing`);
+                        }).catch(e => {
+                            addLog(`[RemoteCmd] Play error: ${e.message}, trying reload`);
+                            // Try reloading and playing
+                            audio.load();
+                            audio.play().catch(e2 => addLog(`[RemoteCmd] Reload play error: ${e2.message}`));
+                        });
+                    } else {
+                        addLog(`[RemoteCmd] No audio src, cannot play`);
+                    }
+                    break;
+                case 'pause':
+                    audio.pause();
+                    addLog(`[RemoteCmd] ⏸️ Paused`);
+                    break;
+                case 'next':
+                case 'prev': {
+                    // Trigger next/prev via load event so ffplay picks it up
+                    const direction = type === 'next' ? 1 : -1;
+                    const songs = stateRef.current?.songs || [];
+                    const current = stateRef.current?.currentTrack;
+                    const loopMode = stateRef.current?.loopMode;
+                    if (songs.length > 0 && current) {
+                        const idx = songs.findIndex(s => s.id === current.id);
+                        let nextIdx;
+                        if (loopMode === 'shuffle') {
+                            // Shuffle: pick a random track (different from current)
+                            nextIdx = Math.floor(Math.random() * songs.length);
+                            if (songs.length > 1 && nextIdx === idx) {
+                                nextIdx = (nextIdx + 1) % songs.length;
+                            }
+                        } else {
+                            nextIdx = (idx + direction + songs.length) % songs.length;
+                        }
+                        const nextSong = songs[nextIdx];
+                        if (nextSong) {
+                            // Emit as load so server triggers ffplay
+                            socket.emit('player_action', { type: 'load', payload: nextSong });
+                            addLog(`[RemoteCmd] ${type}${loopMode === 'shuffle' ? ' 🔀' : ''}: ${nextSong.title}`);
+                        }
+                    }
+                    break;
+                }
+                case 'volume':
+                    if (typeof payload === 'number') audio.volume = payload;
+                    break;
+                case 'seek':
+                    if (typeof payload === 'number') audio.currentTime = payload;
+                    break;
+                case 'gain':
+                    if (typeof payload === 'number' && gainNodeRef.current) {
+                        gainNodeRef.current.gain.value = payload;
+                    }
+                    break;
+                case 'loop':
+                    // Loop mode change — handled by state
+                    break;
+                case 'duration':
+                    // Duration info from peer — ignore
+                    break;
+                default:
+                    addLog(`[RemoteCmd] Unhandled: ${type}`);
+            }
+        };
+
+        socket.on('player_action', handlePlayerAction);
+        return () => socket.off('player_action', handlePlayerAction);
+    }, [socket]);
+
+    // Main state_update handler — uses ref to avoid stale closures
+    useEffect(() => {
+        if (!socket) return;
+
+        const handleState = (newState) => {
+            const prev = stateRef.current;
+            setState(ns => ({ ...ns, ...newState }));
+
+            const audio = audioRef.current;
+            if (!audio) return;
+
+            // Load new track (only from full state updates with currentTrack)
+            if (newState.currentTrack && newState.currentTrack.id !== prev.currentTrack?.id && newState.currentTrack.url && isHeadlessPlayer) {
+                const stAudio = audioRef.current;
+                if (!stAudio) return;
+                if (audioContextRef.current?.state === 'suspended') audioContextRef.current.resume();
+                addLog(`[State] New track: ${newState.currentTrack.title}`);
+                stAudio.src = newState.currentTrack.url;
+                stAudio.load();
+                if (newState.playing !== false) {
+                    setTimeout(() => {
+                        stAudio.play().catch(e => addLog(`Play error: ${e.message}`));
+                    }, 500);
+                }
+            }
+
+            // Play/Pause — only in headless player mode
+            if (newState.playing !== undefined && isHeadlessPlayer) {
+                if (newState.playing && audio.paused && audio.src) {
+                    audio.play().catch(() => { });
+                }
+                if (newState.playing === false && !audio.paused) {
+                    audio.pause();
+                }
+            }
+
+            // Volume
+            if (newState.volume !== undefined) {
+                audio.volume = newState.volume;
+            }
+
+            // Seek (only react to significant differences)
+            if (newState.currentTime !== undefined && Math.abs(newState.currentTime - audio.currentTime) > 2) {
+                audio.currentTime = newState.currentTime;
+            }
+
+            // Gain
+            if (newState.gain !== undefined && gainNodeRef.current) {
+                gainNodeRef.current.gain.value = newState.gain;
+            }
+        };
+
+        const handleData = (d) => setData(d);
+        const handleSlots = (slots) => {
+            setActiveVoiceSlots(slots);
+            // Only duck when there's an ACTIVE stage slot (not silence)
+            const hasActive = Array.isArray(slots)
+                ? slots.some(s => s.stage === 'active')
+                : Object.values(slots).some(s => s.stage === 'active');
+            setIsVoiceActive(hasActive);
+        };
+
+        const handleVoiceData = (data) => {
+            // Dispatch to slot-specific VoicePlayer
+            const event = new CustomEvent(`voice_data_${data.slotId}`, { detail: data });
+            window.dispatchEvent(event);
+        };
+
+        socket.on('state_update', handleState);
+        socket.on('data_update', handleData);
+        socket.on('slots_update', handleSlots);
+        socket.on('voice_data', handleVoiceData);
+        socket.emit('get_data');
+
+        return () => {
+            socket.off('state_update', handleState);
+            socket.off('data_update', handleData);
+            socket.off('slots_update', handleSlots);
+            socket.off('voice_data', handleVoiceData);
+        };
+    }, [socket]);
+
+    // Time sync: send time_update separately (as original does)
+    useEffect(() => {
+        const audio = audioRef.current;
+        if (!audio || !socket) return;
+
+        const onTime = () => {
+            socket.emit('time_update', audio.currentTime);
+        };
+        const onDuration = () => {
+            socket.emit('player_action', { type: 'duration', payload: audio.duration });
+        };
+        const onEnded = () => {
+            addLog('[Audio] Track ended');
+            // Let server handle track_ended logic via next action
+            const cur = stateRef.current;
+            if (cur.loopMode === 'single') {
+                audio.currentTime = 0;
+                audio.play().catch(() => { });
+            } else {
+                socket.emit('player_action', { type: 'next' });
+            }
+        };
+
+        audio.addEventListener('timeupdate', onTime);
+        audio.addEventListener('loadedmetadata', onDuration);
+        audio.addEventListener('ended', onEnded);
+        return () => {
+            audio.removeEventListener('timeupdate', onTime);
+            audio.removeEventListener('loadedmetadata', onDuration);
+            audio.removeEventListener('ended', onEnded);
+        };
+    }, [socket]);
+
+    const handleRemovePlaylist = (id) => { if (confirm('删除？')) socket.emit('delete_playlist', id); };
+    const handleRemoveSong = (id) => { if (confirm('删除？')) socket.emit('delete_song', id); };
+
+    const activePlaylists = showHidden ? data.playlists : data.playlists.filter(p => !p.hidden);
+    const displaySongs = showHidden
+        ? data.songs.filter(s => s.playlistId === selectedPlaylistId)
+        : data.songs.filter(s => s.playlistId === selectedPlaylistId && !s.hidden);
+
+
+    // Auto-init audio engine for headless Chrome (mode=player)
+    useEffect(() => {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('mode') === 'player') {
+            console.log('[Player] mode=player detected, auto-initializing audio engine...');
+            setTimeout(() => {
+                // Create Audio element if not exists (headless Chrome has no UI to create it)
+                if (!audioRef.current) {
+                    audioRef.current = new Audio();
+                // Create full AudioContext pipeline (must be done once)
+                if (!audioContextRef.current) {
+                    audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                try {
+                    if (!sourceRef.current) {
+                        sourceRef.current = audioContextRef.current.createMediaElementSource(audioRef.current);
+                        sourceRef.current.connect(audioContextRef.current.destination);
+                        console.log('[Headless] AudioContext pipeline created');
+                    }
+                } catch(e) { console.log('[Headless] pipeline error:', e.message); }
+                    audioRef.current.crossOrigin = 'anonymous';
+                    console.log('[Player] Created Audio element for headless mode');
+                }
+                initAudioContext(true);
+                console.log('[Player] Audio engine auto-initialized for headless mode');
+            }, 2000);
+        }
+    }, []);
+
+    const runBeepTest = () => {
+        initAudioContext(false);
+        if (!audioContextRef.current) return;
+        const osc = audioContextRef.current.createOscillator();
+        const gn = audioContextRef.current.createGain();
+        osc.connect(gn);
+        gn.connect(audioContextRef.current.destination);
+        osc.frequency.value = 440;
+        gn.gain.value = 0.1;
+        osc.start();
+        setTimeout(() => osc.stop(), 200);
+        addLog('Beep test played');
+    };
+
+    // ==================== Voice Ducking Effect ====================
+    // When voice is active: ramp music down to 15%. When voice ends: ramp back to 1.0.
+    const isDuckedRef = useRef(false);
+    useEffect(() => {
+        const duckGain = duckGainRef.current;
+        const ctx = audioContextRef.current;
+        if (!duckGain || !ctx) return;
+
+        const DUCK_LEVEL = 0.15;   // Music drops to 15% during voice
+        const RAMP_TIME = 0.5;     // 500ms smooth transition
+
+        if (isVoiceActive && !isDuckedRef.current) {
+            // Duck the music
+            isDuckedRef.current = true;
+            const now = ctx.currentTime;
+            duckGain.gain.cancelScheduledValues(now);
+            duckGain.gain.setValueAtTime(duckGain.gain.value, now);
+            duckGain.gain.linearRampToValueAtTime(DUCK_LEVEL, now + RAMP_TIME);
+            addLog(`[🔇 Duck] Music → ${(DUCK_LEVEL * 100).toFixed(0)}% (voice active)`);
+        } else if (!isVoiceActive && isDuckedRef.current) {
+            // Restore the music
+            isDuckedRef.current = false;
+            const now = ctx.currentTime;
+            duckGain.gain.cancelScheduledValues(now);
+            duckGain.gain.setValueAtTime(duckGain.gain.value, now);
+            duckGain.gain.linearRampToValueAtTime(1.0, now + RAMP_TIME);
+            addLog(`[🔊 Unduck] Music → 100% (voice ended)`);
+        }
+    }, [isVoiceActive]);
+
+    // Active voice slot IDs for VoicePlayer rendering
+    const activeSlotIds = Array.isArray(activeVoiceSlots)
+        ? [...new Set(activeVoiceSlots.filter(s => s.stage === 'active').map(s => s.slotId))]
+        : [];
+
+    // Close password menu when clicking outside
+    useEffect(() => {
+        if (!showPwdMenu) return;
+        const handleClickOutside = (e) => {
+            if (pwdMenuRef.current && !pwdMenuRef.current.contains(e.target)) {
+                setShowPwdMenu(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+    }, [showPwdMenu]);
+
+    return (
+        <div className="h-full flex flex-col gap-2 p-3 overflow-y-auto scroll-allowed relative z-10">
+            {/* Debug Panel */}
+            {showDebug && (
+                <div className="absolute top-0 right-0 w-80 h-full bg-black/90 z-50 p-2 font-mono text-[10px] text-green-400 overflow-y-auto border-l border-prince-gold/20 scroll-allowed" onClick={() => setShowDebug(false)}>
+                    <div className="font-bold border-b border-green-500/50 mb-2 pb-1">Debug Logs (Click to close)</div>
+                    {logs.map((L, i) => <div key={i} className="mb-1 break-all">{L}</div>)}
+                </div>
+            )}
+
+            {/* Render Active Voice Players — pass shared AudioContext for boost */}
+            {activeSlotIds.map(slotId => (
+                <VoicePlayer
+                    key={slotId}
+                    slotId={slotId}
+                    addLog={addLog}
+                    voiceAudioContext={audioContextRef.current}
+                    voiceGainNode={voiceGainNodeRef.current}
+                />
+            ))}
+
+            {/* Activation Overlay */}
+            {!manualActivated && (
+                <div className="absolute inset-0 z-[100] bg-prince-deep/95 flex flex-col items-center justify-center p-8 text-center">
+                    <div className="text-6xl mb-6 animate-float">⭐</div>
+                    <h2 className="font-hand text-2xl text-prince-gold mb-2">启动音频引擎</h2>
+                    <p className="text-prince-muted mb-8 max-w-sm text-sm">
+                        请点击下方按钮以允许浏览器处理音频增益和同步。
+                    </p>
+                    <button
+                        onClick={() => initAudioContext(true)}
+                        className="bg-gradient-to-r from-prince-rose to-prince-gold text-prince-deep px-10 py-5 rounded-full font-bold text-xl shadow-star active:scale-95 transition-all font-hand"
+                    >
+                        🌟 启动音频引擎
+                    </button>
+                    <div className="mt-8 text-xs text-prince-muted font-mono">
+                        System: {audioContextReady ? 'READY' : 'WAITING'} | {audioContextRef.current?.state || 'no-context'}
+                    </div>
+                </div>
+            )}
+
+            {/* Admin buttons */}
+            <div className="flex gap-2 items-center shrink-0 flex-wrap">
+                <button onClick={() => setShowAdminModal('Add Cookies')} className="btn-prince flex items-center gap-2 text-xs">
+                    <Download size={14} /> 🍪 Cookies
+                </button>
+                <div className="relative" ref={pwdMenuRef}>
+                    <button onClick={() => setShowPwdMenu(!showPwdMenu)} className={clsx("btn-prince flex items-center gap-2 text-xs", showPwdMenu && "bg-prince-gold/20")}>
+                        <KeyRound size={14} /> 修改密码 <ChevronDown size={12} className={clsx("transition-transform", showPwdMenu && "rotate-180")} />
+                    </button>
+                    {showPwdMenu && (
+                        <div className="absolute top-full left-0 mt-1 glass-panel rounded-xl py-1 min-w-[160px] z-50 animate-in shadow-xl border border-prince-gold/20">
+                            <button onClick={() => { setShowAdminModal('changePwd_player'); setShowPwdMenu(false); }}
+                                className="w-full text-left px-4 py-2.5 text-xs text-prince-cream hover:bg-prince-gold/10 transition-colors flex items-center gap-2">
+                                🌟 Player 密码
+                            </button>
+                            <button onClick={() => { setShowAdminModal('changePwd_sleep'); setShowPwdMenu(false); }}
+                                className="w-full text-left px-4 py-2.5 text-xs text-prince-cream hover:bg-prince-gold/10 transition-colors flex items-center gap-2">
+                                🔒 睡眠锁密码
+                            </button>
+                            <button onClick={() => { setShowAdminModal('changePwd_lyrics'); setShowPwdMenu(false); }}
+                                className="w-full text-left px-4 py-2.5 text-xs text-prince-cream hover:bg-prince-gold/10 transition-colors flex items-center gap-2">
+                                🌹 歌词/Slots 密码
+                            </button>
+                        </div>
+                    )}
+                </div>
+                <button onClick={() => { setShowHidden(true); }} className="btn-prince flex items-center gap-2 text-xs">
+                    <Eye size={14} /> 显示隐藏
+                </button>
+                <button onClick={() => setShowDebug(!showDebug)} className={clsx("btn-prince text-xs", showDebug && "bg-red-500/20 text-red-300")}>
+                    Debug
+                </button>
+                <button onClick={runBeepTest} className="btn-prince text-xs border-orange-500/30 text-orange-400">
+                    Beep Test
+                </button>
+            </div>
+
+            {/* Playlists & Songs */}
+            <div className="flex gap-4" style={{ minHeight: '45vh' }}>
+                <div className="w-1/3 glass-panel p-3 flex flex-col overflow-hidden">
+                    <h2 className="font-hand text-prince-gold mb-2">🪐 Playlists</h2>
+                    <div className="flex-1 overflow-y-auto no-scrollbar scroll-allowed space-y-2">
+                        {activePlaylists.map(p => (
+                            <div key={p.id} onClick={() => setSelectedPlaylistId(p.id)}
+                                className={clsx("p-3 rounded-lg cursor-pointer transition-colors flex justify-between items-center group",
+                                    selectedPlaylistId === p.id ? "bg-prince-gold/20" : "bg-prince-card/30 hover:bg-prince-gold/10",
+                                    p.hidden && "opacity-50 border border-dashed border-prince-rose"
+                                )}>
+                                <span className="truncate text-sm">{p.name}</span>
+                                <button onClick={(e) => { e.stopPropagation(); handleRemovePlaylist(p.id); }}
+                                    className="opacity-0 group-hover:opacity-100 p-1 hover:text-prince-rose transition-opacity"><Trash2 size={14} /></button>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+                <div className="w-2/3 glass-panel p-3 flex flex-col overflow-hidden">
+                    <h2 className="font-hand text-prince-gold mb-2">🎵 Songs</h2>
+                    {selectedPlaylistId ? (
+                        <div className="flex-1 overflow-y-auto no-scrollbar scroll-allowed space-y-1">
+                            {displaySongs.map(s => (
+                                <div key={s.id} className={clsx("p-2 rounded flex justify-between items-center group",
+                                    state.currentTrack?.id === s.id ? "bg-prince-gold/20 text-prince-gold" : "hover:bg-prince-gold/5",
+                                    s.hidden && "opacity-50 border border-dashed border-prince-rose"
+                                )}>
+                                    <div className="truncate flex-1 cursor-pointer text-sm" onClick={() => socket.emit('player_action', { type: 'load', payload: s })}>
+                                        {s.title || s.url}
+                                    </div>
+                                    <button onClick={(e) => { e.stopPropagation(); handleRemoveSong(s.id); }}
+                                        className="opacity-0 group-hover:opacity-100 p-1 hover:text-prince-rose"><Trash2 size={14} /></button>
+                                </div>
+                            ))}
+                        </div>
+                    ) : (
+                        <div className="flex-1 flex items-center justify-center text-prince-muted font-hand">选择一个播放列表</div>
+                    )}
+                </div>
+            </div>
+
+            {/* Voice Slots — collapsible, hidden by default on mobile */}
+            <div className="shrink-0">
+                <button
+                    onClick={() => setShowVoiceSlots(v => !v)}
+                    className="w-full py-1.5 text-xs text-prince-muted hover:text-prince-gold transition-colors flex items-center justify-center gap-1 font-hand"
+                >
+                    <ChevronDown size={12} className={clsx("transition-transform", showVoiceSlots && "rotate-180")} />
+                    {showVoiceSlots ? '收起 Voice Slots' : '展开 Voice Slots'}
+                </button>
+                {showVoiceSlots && (
+                    <div className="glass-panel p-3 mt-1">
+                        <VoiceSlots onSlotAction={() => { }} addLog={addLog} />
+                    </div>
+                )}
+            </div>
+
+            {/* Now Playing Bar */}
+            <div className="shrink-0 glass-panel p-3 flex items-center gap-4">
+                <div className="w-12 h-12 bg-prince-deep rounded-xl flex items-center justify-center">
+                    {state.playing ? <div className="animate-pulse h-4 w-4 bg-prince-gold rounded-full shadow-star" /> : <Music2 size={18} className="text-prince-muted" />}
+                </div>
+                <div className="flex-1">
+                    <div className="text-sm font-bold truncate">{state.currentTrack?.title || '无曲目'}</div>
+                    <div className="text-xs text-prince-muted">
+                        {isVoiceActive ? '🔇 语音闪避中 (音乐 15%)' : '🔊 正常音量'}
+                        {state.gain > 1.0 && ` | 增益: x${state.gain}`}
+                    </div>
+                </div>
+            </div>
+
+            {/* Modals */}
+            {showAdminModal === 'Add Cookies' && (
+                <AdminModal
+                    title="🍪 Add Cookies"
+                    onClose={() => setShowAdminModal(null)}
+                    onConfirm={async (content) => {
+                        try {
+                            const token = sessionStorage.getItem('auth_player');
+                            await axios.post('/96/api/cookies', { content }, { headers: { 'x-auth-token': token || '' } });
+                            alert('Cookies 已保存');
+                        } catch (e) { alert('保存失败'); }
+                        setShowAdminModal(null);
+                    }}
+                />
+            )}
+            {showAdminModal === 'changePwd_player' && (
+                <ChangePasswordModal type="player" label="Player" onClose={() => setShowAdminModal(null)} />
+            )}
+            {showAdminModal === 'changePwd_sleep' && (
+                <ChangePasswordModal type="sleep" label="睡眠锁" onClose={() => setShowAdminModal(null)} />
+            )}
+            {showAdminModal === 'changePwd_lyrics' && (
+                <ChangePasswordModal type="lyrics" label="歌词/Slots" onClose={() => setShowAdminModal(null)} />
+            )}
+
+            {/* Hidden Audio */}
+            <audio ref={audioRef} crossOrigin="anonymous" style={{ position: 'fixed', top: -100, left: -100, opacity: 0, pointerEvents: 'none' }} />
+        </div>
+    );
+}

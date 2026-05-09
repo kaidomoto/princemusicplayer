@@ -1,0 +1,817 @@
+const { exec, spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const MAX_SESSIONS = 3;
+const SITE_URL = 'https://95.bearu.dpdns.org/96/';
+const BRIDGE_PORTS = [8767, 8768, 8769];
+const CHROME_BIN = '/opt/chrome-pw/chrome';
+
+// PulseAudio settings (studio user)
+// Chrome and Bridge both run as studio user — use unix socket
+const PA_ENV = {
+    XDG_RUNTIME_DIR: '/tmp/runtime-studio',
+    PULSE_SERVER: 'unix:/tmp/runtime-studio/pulse/native'
+};
+
+const activeSessions = new Map();
+
+// Callback hook: called when a track ends naturally (code 0).
+// If callback returns true, it handled the next track (e.g., party queue).
+// If false/undefined, fallback to normal skipTrack.
+let onTrackEndHook = null;
+
+function setOnTrackEndHook(fn) {
+    onTrackEndHook = fn;
+}
+
+function getFreeBridgePort() {
+    const usedPorts = new Set();
+    for (const [, info] of activeSessions) {
+        if (info.bridgePort) usedPorts.add(info.bridgePort);
+    }
+    return BRIDGE_PORTS.find(p => !usedPorts.has(p)) || null;
+}
+
+function runCmd(cmd, timeout = 15000) {
+    return new Promise((resolve, reject) => {
+        exec(cmd, { timeout }, (err, stdout, stderr) => {
+            if (err) reject(err);
+            else resolve(stdout.trim());
+        });
+    });
+}
+
+async function pactl(cmd) {
+    return runCmd(`sudo -u studio XDG_RUNTIME_DIR=/tmp/runtime-studio pactl ${cmd}`);
+}
+
+async function createSession(needsBridge = true) {
+    if (activeSessions.size >= MAX_SESSIONS) {
+        return { error: `Max sessions (${MAX_SESSIONS}) reached` };
+    }
+
+    const sessionId = require('crypto').randomUUID();
+        // Memory safety check
+        const freeMB = parseInt(require("child_process").execSync("free -m | awk '/Mem:/{print $7}'").toString().trim());
+        if (freeMB < 500) {
+            throw new Error(`内存不足 (${freeMB}MB)，拒绝创建 session`);
+        }
+        console.log(`[Session] Memory OK: ${freeMB}MB available`);
+    const shortId = sessionId.slice(0, 8);
+    const sinkName = `session_${shortId}`;
+    const userDataDir = `/tmp/prince-session-${shortId}`;
+
+    console.log(`📻 Creating session: ${sessionId} (needsBridge=${needsBridge})`);
+
+    try {
+        const playerUrl = `${SITE_URL}?session=${sessionId}&mode=player&autoplay=false`;
+        let bridgePort = null;
+        let bridgeWsUrl = null;
+        let bridgePid = null;
+        let chromePid = null;
+        let sinkModule = null;
+
+        // 1. Create PulseAudio null-sink for this session
+        console.log(`  🔊 Creating PulseAudio sink: ${sinkName}`);
+        const moduleId = await pactl(
+            `load-module module-null-sink sink_name=${sinkName} sink_properties=device.description=Session_${shortId}`
+        );
+        sinkModule = moduleId;
+        console.log(`  🔊 Sink created (module ${moduleId})`);
+
+        // 2. Start headless Chrome for this session
+        console.log(`  🌐 Starting Chrome for session ${shortId}...`);
+        fs.mkdirSync(userDataDir, { recursive: true });
+        require('child_process').execSync(`chown studio:studio ${userDataDir}`);
+
+        const chromeArgs = [
+            '--headless=new',
+            '--no-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+            '--autoplay-policy=no-user-gesture-required',
+            '--disable-features=AudioServiceOutOfProcess',
+            '--no-first-run',
+            '--disable-extensions',
+            '--mute-audio=false',
+            '--disable-http-cache',
+            '--disk-cache-size=0',
+            `--remote-debugging-port=${9200 + BRIDGE_PORTS.indexOf(bridgePort)}`,
+            `--user-data-dir=${userDataDir}`,
+            playerUrl
+        ];
+
+        // Use start-chrome.sh script (like start-bridge.sh) - sets env internally
+        const debugPort = 9200 + BRIDGE_PORTS.indexOf(bridgePort);
+        const chromeProc = spawn('sudo', [
+            '-u', 'studio',
+            '/home/studio/start-chrome.sh',
+            sinkName,
+            String(debugPort),
+            userDataDir,
+            playerUrl
+        ], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            detached: true
+        });
+        chromeProc.unref();
+        chromePid = chromeProc.pid;
+        console.log(`  🌐 Chrome started (PID ${chromePid}, debug port ${debugPort})`);
+        
+        // Inject audio pipeline via CDP after page loads
+        setTimeout(async () => {
+            await injectAudioViaCDP(debugPort);
+        }, 5000);
+
+        // 3. Start or reuse bridge for this session
+        if (needsBridge) {
+            bridgePort = getFreeBridgePort();
+            if (!bridgePort) {
+                // Cleanup
+                if (chromePid) try { process.kill(-chromePid, 'SIGTERM'); } catch (_) {}
+                if (sinkModule) try { await pactl(`unload-module ${sinkModule}`); } catch (_) {}
+                return { error: 'No free bridge port available' };
+            }
+
+            // Kill ALL old start-bridge.sh processes for this port to prevent zombie accumulation
+            try {
+                await runCmd(`pkill -f 'start-bridge.sh ${bridgePort}' 2>/dev/null || true`);
+                console.log('  🧹 Killed old start-bridge.sh processes for port ' + bridgePort);
+            } catch (_) {}
+
+            // Check if bridge WS server is still running on this port
+            let bridgeAlreadyRunning = false;
+            try {
+                const check = await runCmd(`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${bridgePort}/ 2>/dev/null || echo 000`);
+                bridgeAlreadyRunning = (check === '426');
+            } catch (_) {}
+
+            if (bridgeAlreadyRunning) {
+                // === REUSE existing bridge ===
+                console.log(`  ♻️ Bridge already running on port ${bridgePort}, reusing`);
+
+                // Redirect bridge's audio capture to new session's sink monitor
+                // Find bridge's source-output index and move it to new source
+                try {
+                    // List source-outputs, find the one from bridge (Wine/Electron process)
+                    const soList = await runCmd(
+                        `sudo -u studio XDG_RUNTIME_DIR=/tmp/runtime-studio pactl list source-outputs short 2>/dev/null || true`
+                    );
+                    if (soList) {
+                        const lines = soList.split('\n');
+                        for (const line of lines) {
+                            const parts = line.trim().split('\t');
+                            if (parts.length >= 2) {
+                                const soIndex = parts[0];
+                                // Move this source-output to the new session's monitor
+                                await runCmd(
+                                    `sudo -u studio XDG_RUNTIME_DIR=/tmp/runtime-studio pactl move-source-output ${soIndex} ${sinkName}.monitor 2>/dev/null || true`
+                                );
+                                console.log(`  🔄 Redirected source-output ${soIndex} → ${sinkName}.monitor`);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.log(`  ⚠️ Audio redirect failed: ${e.message}`);
+                }
+
+                bridgeWsUrl = `/96/agora-ws-${bridgePort}/`;
+                console.log(`  🔗 Bridge reused: port ${bridgePort}, ws=${bridgeWsUrl}`);
+            } else {
+                // === START new bridge ===
+                // Kill ALL stale processes on this port
+                await runCmd(`fuser -k ${bridgePort}/tcp 2>/dev/null || true`);
+                // agora processes cleaned up by fuser -k above
+                await new Promise(r => setTimeout(r, 2000));
+
+                const bridgeDir = `/home/studio/agora-bridge-${bridgePort}`;
+                console.log(`  🎵 Starting NEW bridge on port ${bridgePort}...`);
+
+                const bridgeProc = spawn('sudo', [
+                    '-u', 'studio',
+                    '/home/studio/start-bridge.sh',
+                    String(bridgePort),
+                    'virtual_out',
+                    `${sinkName}.monitor`
+                ], {
+                    cwd: bridgeDir,
+                    env: {
+                        ...process.env,
+                        HOME: '/home/studio',
+                        PATH: '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+                    },
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    detached: true
+                });
+                bridgeProc.unref();
+                bridgePid = bridgeProc.pid;
+                console.log(`  🎵 Bridge started (PID ${bridgePid}, port ${bridgePort})`);
+
+                // Wait for bridge to initialize (Wine startup)
+                console.log(`  ⏳ Waiting for bridge to initialize...`);
+                await new Promise(r => setTimeout(r, 8000));
+
+                // Verify bridge is listening
+                try {
+                    const check = await runCmd(`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${bridgePort}/ 2>/dev/null || echo 000`);
+                    if (check === '426') {
+                        console.log(`  ✅ Bridge verified (HTTP 426 = WebSocket ready)`);
+                    } else {
+                        console.log(`  ⚠️ Bridge check returned: ${check} (may need more time)`);
+                    }
+                } catch (_) {}
+
+                bridgeWsUrl = `/96/agora-ws-${bridgePort}/`;
+                console.log(`  🔗 Bridge ready: port ${bridgePort}, ws=${bridgeWsUrl}`);
+            }
+        }
+
+        // Store session info
+        activeSessions.set(sessionId, {
+            shortId,
+            sinkName,
+            sinkModule,
+            userDataDir,
+            createdAt: new Date().toISOString(),
+            playerUrl,
+            bridgePort,
+            bridgePid,
+            chromePid,
+            debugPort,
+            needsBridge,
+            channel: null
+        });
+
+        return {
+            sessionId,
+            shortId,
+            playerUrl,
+            bridgePort,
+            bridgeWsUrl,
+            count: activeSessions.size,
+            maxSessions: MAX_SESSIONS
+        };
+    } catch (err) {
+        console.error(`  ❌ Session creation failed:`, err.message);
+        return { error: err.message };
+    }
+}
+
+async function deleteSession(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session) return { error: 'Session not found' };
+
+    console.log(`🗑️ Deleting session: ${sessionId}`);
+
+    try {
+        // 1. Bridge: keep running for reuse (don't kill)
+        if (session.bridgePid) {
+            console.log(`  ♻️ Bridge kept alive for reuse (PID ${session.bridgePid}, port ${session.bridgePort})`);
+            // Send 'leave' via WS to disconnect from Agora channel (but keep bridge process)
+            try {
+                const WebSocket = require('ws');
+                const ws = new WebSocket(`ws://127.0.0.1:${session.bridgePort}`);
+                ws.on('open', () => {
+                    ws.send(JSON.stringify({ action: 'leave' }));
+                    ws.send(JSON.stringify({ action: 'mute' }));
+                    console.log(`  🔇 Bridge leave+mute sent`);
+                    setTimeout(() => ws.close(), 500);
+                });
+                ws.on('error', () => {}); // ignore
+            } catch (_) {}
+        }
+
+        // 2. Kill Chrome process group
+        if (session.chromePid) {
+            try {
+                process.kill(-session.chromePid, 'SIGTERM');
+                console.log(`  🌐 Chrome killed (PID group ${session.chromePid})`);
+            } catch (_) {}
+        }
+
+        // 3. Remove PulseAudio sink
+        if (session.sinkModule) {
+            try {
+                await pactl(`unload-module ${session.sinkModule}`);
+                console.log(`  🔊 Sink removed (module ${session.sinkModule})`);
+            } catch (_) {}
+        }
+
+        // 4. Clean up user data dir
+        if (session.userDataDir) {
+            try {
+                await runCmd(`rm -rf ${session.userDataDir}`);
+            } catch (_) {}
+        }
+
+        activeSessions.delete(sessionId);
+        return { success: true, count: activeSessions.size };
+    } catch (err) {
+        return { error: err.message };
+    }
+}
+
+function listSessions() {
+    const sessions = [];
+    for (const [id, info] of activeSessions) {
+        sessions.push({
+            sessionId: id,
+            shortId: info.shortId,
+            createdAt: info.createdAt,
+            bridgePort: info.bridgePort || null,
+            needsBridge: info.needsBridge,
+            channel: info.channel || null,
+            accountId: info.accountId || null,
+            bridgeWsUrl: info.bridgePort ? `/96/agora-ws-${info.bridgePort}/` : null,
+            roomInfo: info.roomInfo || null
+        });
+    }
+    return {
+        sessions,
+        count: activeSessions.size,
+        maxSessions: MAX_SESSIONS
+    };
+}
+
+function setSessionChannel(sessionId, channel) {
+    const session = activeSessions.get(sessionId);
+    if (session) {
+        session.channel = channel;
+        console.log(`  📡 Channel stored for session ${sessionId.slice(0,8)}: ${channel.slice(0,20)}...`);
+    }
+}
+
+function getSessionChannel(sessionId) {
+    const session = activeSessions.get(sessionId);
+    return session ? session.channel : null;
+}
+
+
+// CDP Audio Injection - injects AudioContext pipeline into headless Chrome
+async function injectAudioViaCDP(debugPort, retries = 5) {
+    const http = require('http');
+    const { WebSocket } = require('ws');
+    
+    for (let i = 0; i < retries; i++) {
+        try {
+            const pages = await new Promise((resolve, reject) => {
+                http.get(`http://127.0.0.1:${debugPort}/json`, (res) => {
+                    let data = '';
+                    res.on('data', d => data += d);
+                    res.on('end', () => resolve(JSON.parse(data)));
+                }).on('error', reject);
+            });
+            
+            const page = pages.find(p => p.type === 'page');
+            if (!page) { await new Promise(r => setTimeout(r, 2000)); continue; }
+            
+            await new Promise((resolve, reject) => {
+                const ws = new WebSocket(page.webSocketDebuggerUrl);
+                const timeout = setTimeout(() => { ws.close(); reject(new Error('CDP timeout')); }, 10000);
+                
+                ws.on('open', () => {
+                    // Inject: create Audio + AudioContext + source pipeline
+                    ws.send(JSON.stringify({
+                        id: 1,
+                        method: 'Runtime.evaluate',
+                        params: {
+                            expression: `
+                                (() => {
+                                    if (window.__audioInjected) return 'already injected';
+                                    window.__audioCtx = new AudioContext();
+                                    window.__audio = new Audio();
+                                    // crossOrigin removed - causes silent output with createMediaElementSource
+                                    window.__source = window.__audioCtx.createMediaElementSource(window.__audio);
+                                    window.__source.connect(window.__audioCtx.destination);
+                                    window.__audioInjected = true;
+                                    console.log('[CDP] Audio pipeline injected');
+                                    return 'injected';
+                                })()
+                            `,
+                            awaitPromise: false
+                        }
+                    }));
+                });
+                
+                ws.on('message', (msg) => {
+                    const resp = JSON.parse(msg);
+                    if (resp.id === 1) {
+                        clearTimeout(timeout);
+                        console.log(`[CDP] Audio inject result: ${resp.result?.result?.value}`);
+                        ws.close();
+                        resolve();
+                    }
+                });
+                
+                ws.on('error', (e) => { clearTimeout(timeout); reject(e); });
+            });
+            
+            return true;
+        } catch (e) {
+            console.log(`[CDP] Retry ${i + 1}/${retries}: ${e.message}`);
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+    console.log('[CDP] Failed to inject audio after retries');
+    return false;
+}
+
+// CDP: Play audio URL in headless Chrome
+async function cdpPlayAudio(debugPort, url) {
+    const http = require('http');
+    const { WebSocket } = require('ws');
+    
+    try {
+        const pages = await new Promise((resolve, reject) => {
+            http.get(`http://127.0.0.1:${debugPort}/json`, (res) => {
+                let data = '';
+                res.on('data', d => data += d);
+                res.on('end', () => resolve(JSON.parse(data)));
+            }).on('error', reject);
+        });
+        
+        const page = pages.find(p => p.type === 'page');
+        if (!page) return false;
+        
+        await new Promise((resolve, reject) => {
+            const ws = new WebSocket(page.webSocketDebuggerUrl);
+            const timeout = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
+            
+            ws.on('open', () => {
+                ws.send(JSON.stringify({
+                    id: 1,
+                    method: 'Runtime.evaluate',
+                    params: {
+                        expression: `
+                            (async () => {
+                                const ctx = window.__audioCtx;
+                                if (!ctx) return 'no audio context';
+                                if (ctx.state === 'suspended') await ctx.resume();
+                                // Stop previous source if playing
+                                if (window.__currentSource) {
+                                    try { window.__currentSource.stop(); } catch(e) {}
+                                }
+                                // Fetch and decode audio data (bypasses CORS)
+                                const resp = await fetch('${url.replace(/'/g, "\\'")}');
+                                const buf = await resp.arrayBuffer();
+                                const audioBuf = await ctx.decodeAudioData(buf);
+                                const source = ctx.createBufferSource();
+                                source.buffer = audioBuf;
+                                source.connect(ctx.destination);
+                                source.start();
+                                window.__currentSource = source;
+                                return 'playing(decoded): ' + '${url.replace(/'/g, "\\'")}'.slice(-30);
+                            })()
+                        `,
+                        awaitPromise: true
+                    }
+                }));
+            });
+            
+            ws.on('message', (msg) => {
+                const resp = JSON.parse(msg);
+                if (resp.id === 1) {
+                    clearTimeout(timeout);
+                    console.log(`[CDP] Play result: ${resp.result?.result?.value || resp.result?.exceptionDetails?.text}`);
+                    ws.close();
+                    resolve();
+                }
+            });
+            
+            ws.on('error', (e) => { clearTimeout(timeout); reject(e); });
+        });
+        return true;
+    } catch (e) {
+        console.log(`[CDP] Play error: ${e.message}`);
+        return false;
+    }
+}
+
+
+// Play a track in a session using ffplay (direct PulseAudio output)
+const { spawn: spawnChild } = require('child_process');
+async function playTrack(sessionId, url) {
+    const session = activeSessions.get(sessionId);
+    if (!session?.sinkName) {
+        console.log(`[Audio] No session for ${sessionId}`);
+        return;
+    }
+    
+    // Kill previous ffplay for this session (kill process group)
+    if (session.ffplayProc) {
+        try { process.kill(-session.ffplayProc.pid, 'SIGKILL'); } catch (_) {}
+        session.ffplayProc = null;
+    }
+    
+    if (url.startsWith('/')) url = 'https://95.bearu.dpdns.org' + url;
+    session.lastUrl = url;
+    console.log(`[Audio] Playing on ${session.sinkName}: ${url.slice(-40)}`);
+    
+    const ffplay = spawnChild('sudo', [
+        '-u', 'studio',
+        'env',
+        'DISPLAY=:99',
+        'XDG_RUNTIME_DIR=/tmp/runtime-studio',
+        'PULSE_SERVER=unix:/tmp/runtime-studio/pulse/native',
+        `/home/studio/play-audio.sh`,
+        session.sinkName,
+        url
+    ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true
+    });
+    
+    ffplay.unref();
+    session.ffplayProc = ffplay;
+    
+    ffplay.on('exit', (code) => {
+        console.log(`[Audio] ffplay exited (code ${code}) for ${sessionId}`);
+        if (session.ffplayProc === ffplay) {
+            session.ffplayProc = null;
+            // code 0 = song finished naturally -> auto-next
+            if (code === 0) {
+                // Party mode hook: check party queue first
+                if (onTrackEndHook) {
+                    const handled = onTrackEndHook(sessionId);
+                    if (handled) return; // Party queue handled the next track
+                }
+                // Always use server-side skipTrack for auto-next (ensures currentTrack is
+                // correctly pushed to all clients via state_update — Chrome CDP path
+                // doesn't work because server strips currentTrack from client relay)
+                const tryNext = async () => {
+                    try {
+                        const trackInfo = await exports.skipTrack(sessionId, 1);
+                        if (trackInfo) {
+                            console.log(`[Audio] Server-side auto-next: ${trackInfo.title?.slice(0,40)}`);
+                        }
+                    } catch (e) {
+                        console.log(`[Audio] Auto-next failed for ${sessionId.slice(0,8)}: ${e.message}`);
+                    }
+                };
+                tryNext();
+            }
+        }
+    });
+}
+
+
+// Pause ffplay (SIGSTOP)
+function pauseTrack(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session?.ffplayProc) return;
+    try {
+        process.kill(-session.ffplayProc.pid, 'SIGSTOP');
+        console.log(`[Audio] Paused session ${sessionId.slice(0,8)}`);
+    } catch (_) {}
+}
+
+// Resume ffplay (SIGCONT)
+function resumeTrack(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session?.ffplayProc) return;
+    try {
+        process.kill(-session.ffplayProc.pid, 'SIGCONT');
+        console.log(`[Audio] Resumed session ${sessionId.slice(0,8)}`);
+    } catch (_) {}
+}
+
+// Stop ffplay
+function stopTrack(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session?.ffplayProc) return;
+    try {
+        process.kill(-session.ffplayProc.pid, 'SIGKILL');
+        session.ffplayProc = null;
+        console.log(`[Audio] Stopped session ${sessionId.slice(0,8)}`);
+    } catch (_) {}
+}
+
+// Set volume via PulseAudio (0-100)
+async function setVolume(sessionId, volume) {
+    const session = activeSessions.get(sessionId);
+    if (!session?.sinkName) return;
+    const vol = Math.max(0, Math.min(100, Math.round(volume * 100)));
+    try {
+        await pactl(`set-sink-volume ${session.sinkName} ${vol}%`);
+        console.log(`[Audio] Volume ${vol}% for ${sessionId.slice(0,8)}`);
+    } catch (_) {}
+}
+
+
+// Trigger next track in Chrome Player via CDP
+async function triggerNextTrack(debugPort) {
+    return new Promise((resolve) => {
+        const http = require('http');
+        http.get(`http://127.0.0.1:${debugPort}/json`, (res) => {
+            let d = ''; res.on('data', c => d += c); res.on('end', () => {
+                try {
+                    const pages = JSON.parse(d);
+                    const page = pages.find(p => p.type === 'page');
+                    if (!page) return resolve();
+                    const { WebSocket } = require('ws');
+                    const ws = new WebSocket(page.webSocketDebuggerUrl);
+                    ws.on('open', () => {
+                        // Simulate clicking "next" button in Player
+                        ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: {
+                            expression: `document.querySelector('[data-action="next"]')?.click() || 'no next button'`
+                        }}));
+                    });
+                    ws.on('message', (m) => {
+                        const r = JSON.parse(m);
+                        if (r.id === 1) {
+                            console.log('[Audio] Auto-next triggered via CDP');
+                            ws.close();
+                            resolve();
+                        }
+                    });
+                    setTimeout(() => { ws.close(); resolve(); }, 3000);
+                } catch (e) { resolve(); }
+            });
+        }).on('error', () => resolve());
+    });
+}
+
+
+// Seek: restart ffplay at specific position
+async function seekTrack(sessionId, position) {
+    const session = activeSessions.get(sessionId);
+    if (!session?.sinkName || !session.lastUrl) return;
+    console.log(`[Audio] Seek to ${position}s for ${sessionId.slice(0,8)}`);
+    // Kill current ffplay
+    if (session.ffplayProc) {
+        try { process.kill(-session.ffplayProc.pid, 'SIGKILL'); } catch (_) {}
+        session.ffplayProc = null;
+    }
+    // Restart at position
+    const url = session.lastUrl;
+    const ffplay = spawnChild('sudo', [
+        '-u', 'studio',
+        '/home/studio/play-audio.sh',
+        session.sinkName,
+        url,
+        String(Math.floor(position))
+    ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true
+    });
+    ffplay.unref();
+    session.ffplayProc = ffplay;
+    ffplay.on('exit', (code) => {
+        if (session.ffplayProc === ffplay) {
+            session.ffplayProc = null;
+            if (code === 0 && session.debugPort) {
+                triggerNextTrack(session.debugPort).catch(() => {});
+            }
+        }
+    });
+}
+
+
+
+
+// Skip track (next/prev) - reads songs from DB
+async function skipTrack(sessionId, direction) {
+    const session = activeSessions.get(sessionId);
+    if (!session) return Promise.resolve();
+    
+    // Load songs from DB
+    const fs = require('fs');
+    // Always load from songs.json to ensure we have ALL songs from ALL playlists
+    // session.tracks may be stale (from a different playlist)
+    let songs = [];
+    {
+        try {
+            const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'songs.json'), 'utf8'));
+            songs = Array.isArray(data) ? data : [];
+        } catch (e) {
+            console.log(`[Audio] Skip: cannot read songs.json: ${e.message}`);
+            return null;
+        }
+    }
+    
+    if (songs.length === 0) {
+        console.log(`[Audio] Skip: no songs available`);
+        return null;
+    }
+    
+    // Find current track index by matching lastUrl
+    let currentIdx = -1;
+    if (session.lastUrl) {
+        currentIdx = songs.findIndex(s => session.lastUrl.includes(s.url) || s.url === session.lastUrl);
+    }
+    if (currentIdx < 0) currentIdx = 0;
+    
+    let nextIdx;
+    if (session.shuffleMode) {
+        nextIdx = Math.floor(Math.random() * songs.length);
+        if (songs.length > 1 && nextIdx === currentIdx) {
+            nextIdx = (nextIdx + 1) % songs.length;
+        }
+    } else {
+        nextIdx = (currentIdx + direction + songs.length) % songs.length;
+    }
+    
+    const nextTrack = songs[nextIdx];
+    if (!nextTrack?.url) {
+        console.log(`[Audio] Skip: no URL for track ${nextIdx}`);
+        return Promise.resolve();
+    }
+    
+    console.log(`[Audio] Skip ${direction > 0 ? 'next' : 'prev'}: [${nextIdx}/${songs.length}] ${nextTrack.title || nextTrack.url.slice(-30)}`);
+    
+    await playTrack(sessionId, nextTrack.url);
+    // Return track info so server can push to clients for UI sync
+    return { index: nextIdx, title: nextTrack.title, url: nextTrack.url, id: nextTrack.id, total: songs.length };
+}
+
+// Update session track list (called when load event has full song list)
+function updateTracks(sessionId, tracks, currentTrack) {
+    const session = activeSessions.get(sessionId);
+    if (!session) return;
+    if (Array.isArray(tracks) && tracks.length > 0) {
+        session.tracks = tracks;
+    }
+    if (currentTrack) {
+        const idx = (session.tracks || []).findIndex(t => t.id === currentTrack.id || t.url === currentTrack.url);
+        if (idx >= 0) session.currentTrackIdx = idx;
+    }
+}
+
+// Set shuffle mode
+function setShuffleMode(sessionId, enabled) {
+    const session = activeSessions.get(sessionId);
+    if (session) session.shuffleMode = enabled;
+}
+
+function setSessionMeta(sessionId, key, value) {
+    const info = activeSessions.get(sessionId);
+    if (info) info[key] = value;
+}
+
+
+// Auto-restart a crashed bridge for a session
+async function restartBridge(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session || !session.bridgePort) return { error: 'No bridge to restart' };
+
+    const port = session.bridgePort;
+    const sinkName = session.sinkName;
+    console.log(`🔄 [BridgeRestart] Restarting bridge on port ${port} for session ${sessionId.slice(0,8)}`);
+
+    // 1. Kill any zombie process on this port
+    try { await runCmd(`fuser -k ${port}/tcp 2>/dev/null || true`); } catch (_) {}
+    try { if (session.bridgePid) process.kill(session.bridgePid, 'SIGTERM'); } catch (_) {}
+    await new Promise(r => setTimeout(r, 1500));
+
+    // 2. Start new bridge
+    const bridgeDir = `/home/studio/agora-bridge-${port}`;
+    const { spawn } = require('child_process');
+    const bridgeProc = spawn('sudo', [
+        '-u', 'studio',
+        '/home/studio/start-bridge.sh',
+        String(port),
+        'virtual_out',
+        `${sinkName}.monitor`
+    ], {
+        cwd: bridgeDir,
+        env: {
+            ...process.env,
+            HOME: '/home/studio',
+            PATH: '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true
+    });
+    bridgeProc.unref();
+    session.bridgePid = bridgeProc.pid;
+    console.log(`  🎵 Bridge restarted (PID ${bridgeProc.pid}, port ${port})`);
+
+    // 3. Wait for Wine startup
+    await new Promise(r => setTimeout(r, 8000));
+
+    // 4. Verify bridge is listening
+    try {
+        const check = await runCmd(`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${port}/ 2>/dev/null || echo 000`);
+        if (check.trim() === '426') {
+            console.log(`  ✅ Bridge verified (HTTP 426 = WebSocket ready)`);
+            return { success: true, bridgePort: port, bridgeWsUrl: `/96/agora-ws-${port}/` };
+        } else {
+            console.log(`  ⚠️ Bridge check returned: ${check.trim()}`);
+            return { success: true, bridgePort: port, bridgeWsUrl: `/96/agora-ws-${port}/`, warning: 'may need more time' };
+        }
+    } catch (_) {
+        return { success: true, bridgePort: port, bridgeWsUrl: `/96/agora-ws-${port}/` };
+    }
+}
+
+module.exports = {
+    setOnTrackEndHook,
+    playTrack, pauseTrack, resumeTrack, stopTrack, setVolume, seekTrack, skipTrack,
+    updateTracks, setShuffleMode,
+    getSession: (id) => activeSessions.get(id),
+    setSessionChannel, getSessionChannel,
+    createSession, deleteSession, listSessions, setSessionMeta, MAX_SESSIONS,
+    restartBridge,
+};
+

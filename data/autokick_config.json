@@ -1,0 +1,33 @@
+{
+  "enabled": true,
+  "kickWebListeners": true,
+  "keywordBlocklist": [
+    "狗逼", "死全家", "母狗", "prince", "Betty", "操逼", "傻逼"
+  ],
+  "whitelistIds": [
+    1297026092,
+    1624993321,
+    1017789603,
+    1602673216
+  ],
+  "_whitelistNotes": {
+    "1297026092": "来如春梦（自己）",
+    "1624993321": "Prince",
+    "1017789603": "Harley Quinn",
+    "1602673216": "elPricipito（bot主账号，绝不能踢）"
+  },
+  "blacklistIds": [
+    1077003302,
+    1016587739,
+    1879049903,
+    367037,
+    702271930
+  ],
+  "_blacklistNotes": {
+    "1077003302": "依娜 姚 @tinayao1029",
+    "1016587739": "Jung Ken @jfkguu",
+    "1879049903": "Frank Xiao @frank.w.xiao",
+    "367037": "Barbara Diggs @bab-z",
+    "702271930": "夏任 Jiang @xrjiang"
+  }
+}

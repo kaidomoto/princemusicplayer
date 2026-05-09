@@ -1,0 +1,139 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* === 小王子 Base Styles === */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: 'Inter', sans-serif;
+  background: #0A0F2E;
+  color: #F4F0E6;
+}
+
+body {
+  touch-action: none;
+}
+
+/* === Scrollbar === */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+.scroll-allowed { touch-action: auto !important; }
+
+/* === Glass Panel (Star Dust) === */
+.glass-panel {
+  background: linear-gradient(135deg, rgba(18, 26, 74, 0.8), rgba(12, 20, 69, 0.6));
+  border: 1px solid rgba(232, 182, 74, 0.15);
+  border-radius: 16px;
+  backdrop-filter: blur(12px);
+}
+
+/* === Buttons === */
+.btn-prince {
+  background: linear-gradient(135deg, rgba(232, 182, 74, 0.15), rgba(232, 182, 74, 0.05));
+  border: 1px solid rgba(232, 182, 74, 0.3);
+  border-radius: 12px;
+  padding: 8px 16px;
+  color: #E8B64A;
+  font-weight: 500;
+  transition: all 0.3s ease;
+  cursor: pointer;
+}
+.btn-prince:hover {
+  background: linear-gradient(135deg, rgba(232, 182, 74, 0.25), rgba(232, 182, 74, 0.1));
+  border-color: rgba(232, 182, 74, 0.5);
+  box-shadow: 0 0 16px rgba(232, 182, 74, 0.2);
+}
+.btn-prince:active { transform: scale(0.95); }
+
+.btn-rose {
+  background: linear-gradient(135deg, rgba(212, 69, 106, 0.2), rgba(212, 69, 106, 0.05));
+  border: 1px solid rgba(212, 69, 106, 0.3);
+  border-radius: 12px;
+  padding: 8px 16px;
+  color: #D4456A;
+  font-weight: 500;
+  transition: all 0.3s ease;
+  cursor: pointer;
+}
+.btn-rose:hover {
+  background: linear-gradient(135deg, rgba(212, 69, 106, 0.3), rgba(212, 69, 106, 0.1));
+  box-shadow: 0 0 16px rgba(212, 69, 106, 0.2);
+}
+
+/* === Input === */
+.input-prince {
+  width: 100%;
+  padding: 10px 14px;
+  background: rgba(10, 15, 46, 0.8);
+  border: 1px solid rgba(232, 182, 74, 0.2);
+  border-radius: 12px;
+  color: #F4F0E6;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.3s;
+}
+.input-prince:focus {
+  border-color: rgba(232, 182, 74, 0.6);
+  box-shadow: 0 0 12px rgba(232, 182, 74, 0.15);
+}
+.input-prince::placeholder { color: rgba(123, 140, 173, 0.6); }
+
+/* === Slider (Rose themed) === */
+.prince-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  touch-action: auto !important;
+  background: transparent;
+  width: 100%;
+}
+.prince-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, rgba(232, 182, 74, 0.2), rgba(123, 140, 173, 0.3));
+}
+.prince-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #D4456A, #E8B64A);
+  border: 2px solid #F4F0E6;
+  margin-top: -7px;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(212, 69, 106, 0.5);
+}
+
+/* === Stars Background === */
+.stars-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.star {
+  position: absolute;
+  background: #FFF8DC;
+  border-radius: 50%;
+  animation: twinkle var(--duration) ease-in-out infinite;
+  animation-delay: var(--delay);
+}
+@keyframes twinkle {
+  0%, 100% { opacity: 0.2; transform: scale(0.6); }
+  50% { opacity: 1; transform: scale(1.3); }
+}
+
+/* === Shadow Glow === */
+.shadow-star { box-shadow: 0 0 10px rgba(232, 182, 74, 0.4), 0 0 20px rgba(232, 182, 74, 0.2); }
+.shadow-rose { box-shadow: 0 0 12px rgba(212, 69, 106, 0.4), 0 0 24px rgba(212, 69, 106, 0.2); }
+
+/* === Animate In === */
+.animate-in { animation: fadeSlideIn 0.4s ease-out forwards; }
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}

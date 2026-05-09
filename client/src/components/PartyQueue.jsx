@@ -1,0 +1,428 @@
+import React, { useState, useEffect, useContext } from 'react';
+import { SocketContext } from '../App';
+import clsx from 'clsx';
+import { ChevronDown, ChevronUp, Music2, X, PartyPopper, User } from 'lucide-react';
+
+const MAX_SONGS = 3;
+
+// Identity Selection Modal
+function IdentityModal({ onSelect, onClose, roomUsers, loading }) {
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={onClose}>
+            <div className="bg-prince-dark/95 border border-prince-gold/30 rounded-2xl p-6 w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+                <div className="text-center mb-4">
+                    <PartyPopper className="mx-auto mb-2 text-prince-gold" size={32} />
+                    <h2 className="text-prince-cream font-bold text-lg">选择你的身份</h2>
+                    <p className="text-prince-muted text-xs mt-1">选择你的 Clubhouse 账号来加入 Party</p>
+                </div>
+                
+                {loading ? (
+                    <div className="text-center text-prince-muted py-8">
+                        <div className="animate-spin w-6 h-6 border-2 border-prince-gold/30 border-t-prince-gold rounded-full mx-auto mb-2" />
+                        加载房间用户...
+                    </div>
+                ) : roomUsers.length === 0 ? (
+                    <div className="text-center text-prince-muted py-8">
+                        <p>未找到房间用户</p>
+                        <p className="text-xs mt-1">请先加入 Clubhouse 房间</p>
+                    </div>
+                ) : (
+                    <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1 scrollbar-thin">
+                        {roomUsers.map(u => (
+                            <button
+                                key={u.user_id}
+                                onClick={() => onSelect(u)}
+                                className="w-full flex items-center gap-3 p-2.5 rounded-xl
+                                    bg-prince-gold/5 hover:bg-prince-gold/15 border border-transparent
+                                    hover:border-prince-gold/30 transition-all text-left group"
+                            >
+                                {u.photo_url ? (
+                                    <img src={u.photo_url} alt="" className="w-9 h-9 rounded-full object-cover border border-prince-gold/20" />
+                                ) : (
+                                    <div className="w-9 h-9 rounded-full bg-prince-gold/10 flex items-center justify-center">
+                                        <User size={16} className="text-prince-gold/50" />
+                                    </div>
+                                )}
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-prince-cream text-sm font-medium truncate">{u.name}</div>
+                                    {u.username && (
+                                        <div className="text-prince-muted text-xs truncate">@{u.username}</div>
+                                    )}
+                                </div>
+                                <div className="text-prince-gold/0 group-hover:text-prince-gold/60 text-xs transition-colors">
+                                    选择 →
+                                </div>
+                            </button>
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// Add to Queue Confirm Toast
+function AddConfirm({ song, onConfirm, onCancel }) {
+    return (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-4">
+            <div className="bg-prince-dark/95 border border-prince-gold/40 rounded-2xl p-4 shadow-2xl min-w-[280px]">
+                <p className="text-prince-cream text-sm mb-1 truncate">🎵 {song.title}</p>
+                <p className="text-prince-muted text-xs mb-3">加入 Party 队列？</p>
+                <div className="flex gap-2">
+                    <button onClick={onCancel}
+                        className="flex-1 py-1.5 rounded-lg bg-prince-gold/10 text-prince-muted text-sm hover:bg-prince-gold/20 transition-colors">
+                        取消
+                    </button>
+                    <button onClick={onConfirm}
+                        className="flex-1 py-1.5 rounded-lg bg-prince-gold/80 text-prince-dark text-sm font-bold hover:bg-prince-gold transition-colors">
+                        加入队列
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// Main Party Queue Panel
+export default function PartyQueue({ partyState, partyUser, onSongClick }) {
+    const socket = useContext(SocketContext);
+    const [collapsed, setCollapsed] = useState(false);
+    const [confirmSong, setConfirmSong] = useState(null);
+    const [error, setError] = useState('');
+
+    const queue = partyState?.queue || [];
+    const currentItem = partyState?.currentItem;
+    const enabled = partyState?.enabled;
+    const waitingCount = queue.filter(q => q.status === 'waiting').length;
+    const myCount = partyUser ? queue.filter(q => q.userId === String(partyUser.user_id) && q.status === 'waiting').length : 0;
+
+    // Handle song click from playlist - show confirm dialog
+    useEffect(() => {
+        if (onSongClick) {
+            // Parent sets onSongClick with the song to confirm
+        }
+    }, [onSongClick]);
+
+    const handlePlay = () => {
+        if (!socket) return;
+        socket.emit('party_play', {}, (res) => {
+            if (res?.error) {
+                setError(res.error);
+                setTimeout(() => setError(''), 3000);
+            }
+        });
+    };
+
+    const handleAddToQueue = (song) => {
+        if (!socket || !partyUser) return;
+        socket.emit('party_add', { song }, (res) => {
+            if (res?.error) {
+                setError(res.error);
+                setTimeout(() => setError(''), 3000);
+            }
+            setConfirmSong(null);
+        });
+    };
+
+    const handleRemove = (queueId) => {
+        if (!socket) return;
+        socket.emit('party_remove', { queueId }, (res) => {
+            if (res?.error) {
+                setError(res.error);
+                setTimeout(() => setError(''), 3000);
+            }
+        });
+    };
+
+    if (!enabled) return null;
+
+    return (
+        <>
+            {/* Collapsible Queue Panel */}
+            <div className="mx-3 mb-2">
+                <button
+                    onClick={() => setCollapsed(!collapsed)}
+                    className="w-full flex items-center justify-between px-3 py-2 rounded-xl
+                        bg-gradient-to-r from-prince-gold/10 to-prince-rose/10
+                        border border-prince-gold/20 hover:border-prince-gold/40 transition-all"
+                >
+                    <div className="flex items-center gap-2">
+                        <PartyPopper size={16} className="text-prince-gold" />
+                        <span className="text-prince-cream text-sm font-bold">Party 队列</span>
+                        {waitingCount > 0 && (
+                            <span className="bg-prince-gold/20 text-prince-gold text-xs px-1.5 py-0.5 rounded-full">
+                                {waitingCount}
+                            </span>
+                        )}
+                        {waitingCount > 0 && !currentItem && (
+                            <button
+                                onClick={(e) => { e.stopPropagation(); handlePlay(); }}
+                                className="bg-prince-gold/80 text-prince-dark text-xs px-2.5 py-0.5 rounded-full font-bold hover:bg-prince-gold transition-colors"
+                            >
+                                ▶ 播放
+                            </button>
+                        )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                        {partyUser && (
+                            <span className="text-prince-muted text-xs">我的: {myCount}/{MAX_SONGS}</span>
+                        )}
+                        {collapsed ? <ChevronDown size={14} className="text-prince-muted" /> : <ChevronUp size={14} className="text-prince-muted" />}
+                    </div>
+                </button>
+
+                {!collapsed && (
+                    <div className="mt-1 bg-prince-dark/50 border border-prince-gold/10 rounded-xl overflow-hidden">
+                        {/* Currently Playing */}
+                        {currentItem && (
+                            <div className="px-3 py-2 bg-prince-gold/5 border-b border-prince-gold/10">
+                                <div className="flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-prince-gold animate-pulse" />
+                                    <span className="text-prince-gold text-xs font-bold">正在播放</span>
+                                </div>
+                                <div className="flex items-center gap-2 mt-1">
+                                    {currentItem.photoUrl && (
+                                        <img src={currentItem.photoUrl} className="w-5 h-5 rounded-full" alt="" />
+                                    )}
+                                    <span className="text-prince-cream text-xs truncate flex-1">
+                                        {currentItem.song?.title}
+                                    </span>
+                                    <span className="text-prince-muted text-xs shrink-0">{currentItem.nickname}</span>
+                                    <button
+                                        onClick={() => handleRemove(currentItem.id)}
+                                        className="text-prince-muted hover:text-prince-rose text-xs ml-1 transition-colors shrink-0"
+                                        title="移除当前播放"
+                                    >✕</button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Waiting Queue */}
+                        {queue.filter(q => q.status === 'waiting').length > 0 ? (
+                            <div className="max-h-40 overflow-y-auto">
+                                {queue.filter(q => q.status === 'waiting').map((item, i) => (
+                                    <div key={item.id}
+                                        className="flex items-center gap-2 px-3 py-1.5 border-b border-prince-gold/5 last:border-0"
+                                    >
+                                        <span className="text-prince-muted text-xs w-4 text-right shrink-0">{i + 1}</span>
+                                        {item.photoUrl && (
+                                            <img src={item.photoUrl} className="w-5 h-5 rounded-full" alt="" />
+                                        )}
+                                        <span className="text-prince-cream/80 text-xs truncate flex-1">
+                                            {item.song?.title}
+                                        </span>
+                                        <span className="text-prince-muted text-xs shrink-0">{item.nickname}</span>
+                                        {partyUser && String(item.userId) === String(partyUser.user_id) && (
+                                            <button
+                                                onClick={() => handleRemove(item.id)}
+                                                className="text-prince-rose/50 hover:text-prince-rose transition-colors"
+                                            >
+                                                <X size={12} />
+                                            </button>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="text-center text-prince-muted text-xs py-4">
+                                {partyUser ? '🎵 从歌单中选歌加入队列' : '选择身份后即可点歌'}
+                            </div>
+                        )}
+
+                        {/* Error */}
+                        {error && (
+                            <div className="px-3 py-1.5 bg-red-500/10 text-red-400 text-xs text-center">
+                                {error}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            {/* Add Confirm Dialog */}
+            {confirmSong && (
+                <AddConfirm
+                    song={confirmSong}
+                    onConfirm={() => handleAddToQueue(confirmSong)}
+                    onCancel={() => setConfirmSong(null)}
+                />
+            )}
+        </>
+    );
+}
+
+// Export sub-components
+function WhitelistModal({ onClose }) {
+    const [users, setUsers] = React.useState([]);
+    const [loading, setLoading] = React.useState(true);
+    const [mode, setMode] = React.useState('auto');
+
+    const basePath = window.location.pathname.replace(/\/$/, '');
+    const [activeChannel, setActiveChannel] = React.useState(null);
+
+    // Get active channel from sessions
+    React.useEffect(() => {
+        fetch(basePath + '/api/sessions').then(r => r.json()).then(d => {
+            const sess = (d.sessions || [])[0];
+            if (sess?.roomInfo?.channel) setActiveChannel(sess.roomInfo.channel);
+        }).catch(() => {});
+    }, []);
+
+    const handleManualInvite = async (userId) => {
+        if (!activeChannel) { alert('没有活跃的房间'); return; }
+        try {
+            const res = await fetch(basePath + '/api/clubhouse/invite_speaker', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
+                body: JSON.stringify({ channel: activeChannel, user_id: userId })
+            });
+            const data = await res.json();
+            if (data.success === false) alert('邀请失败: ' + (data.error_message || ''));
+            else alert('✅ 已发送邀请');
+        } catch (e) { alert('邀请失败'); }
+    };
+
+    const handleMakeModerator = async (userId) => {
+        if (!activeChannel) { alert('没有活跃的房间'); return; }
+        if (!confirm('确定设为 Moderator？')) return;
+        try {
+            const res = await fetch(basePath + '/api/clubhouse/make_moderator', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
+                body: JSON.stringify({ channel: activeChannel, user_id: userId })
+            });
+            const data = await res.json();
+            if (data.success === false) alert('设置失败: ' + (data.error_message || ''));
+            else alert('✅ 已设为 Moderator');
+        } catch (e) { alert('设置失败'); }
+    };
+
+    const fetchUsers = async () => {
+        try {
+            const res = await fetch(basePath + '/api/clubhouse/speaker_whitelist');
+            const data = await res.json();
+            setUsers(data.users || []);
+            if (data.mode) setMode(data.mode);
+        } catch (_) {}
+        setLoading(false);
+    };
+
+    const handleModeChange = async (newMode) => {
+        setMode(newMode);
+        try {
+            await fetch(basePath + '/api/clubhouse/whitelist_config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
+                body: JSON.stringify({ mode: newMode })
+            });
+        } catch (_) {}
+    };
+
+    React.useEffect(() => { fetchUsers(); }, []);
+
+    const toggleWhitelist = async (userId, isWhitelisted) => {
+        const endpoint = isWhitelisted ? '/api/clubhouse/speaker_whitelist/remove' : '/api/clubhouse/speaker_whitelist/add';
+        try {
+            await fetch(basePath + endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
+                body: JSON.stringify({ user_id: userId })
+            });
+            setUsers(prev => prev.map(u =>
+                u.user_id === userId ? { ...u, whitelisted: !isWhitelisted } : u
+            ));
+        } catch (_) {}
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={onClose}>
+            <div className="bg-prince-dark/95 border border-prince-gold/30 rounded-2xl p-5 w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+                <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-prince-cream font-bold text-base">🎤 上台白名单</h2>
+                    <button onClick={onClose} className="text-prince-muted hover:text-prince-cream text-lg">✕</button>
+                </div>
+                <p className="text-prince-muted text-xs mb-2">白名单用户自动被邀请上台</p>
+                <div className="flex gap-1 mb-3">
+                    <button
+                        onClick={() => handleModeChange('auto')}
+                        className={`flex-1 text-xs py-1.5 rounded-lg font-medium transition-all ${
+                            mode === 'auto'
+                                ? 'bg-prince-gold/20 text-prince-gold border border-prince-gold/40'
+                                : 'bg-prince-gold/5 text-prince-muted border border-transparent hover:text-prince-cream'
+                        }`}
+                    >🟢 自动邀请</button>
+                    <button
+                        onClick={() => handleModeChange('hand')}
+                        className={`flex-1 text-xs py-1.5 rounded-lg font-medium transition-all ${
+                            mode === 'hand'
+                                ? 'bg-prince-gold/20 text-prince-gold border border-prince-gold/40'
+                                : 'bg-prince-gold/5 text-prince-muted border border-transparent hover:text-prince-cream'
+                        }`}
+                    >✋ 举手时邀请</button>
+                </div>
+
+                {loading ? (
+                    <div className="text-center text-prince-muted py-8">
+                        <div className="animate-spin w-6 h-6 border-2 border-prince-gold/30 border-t-prince-gold rounded-full mx-auto mb-2" />
+                        加载中...
+                    </div>
+                ) : users.length === 0 ? (
+                    <div className="text-center text-prince-muted py-8">
+                        <p>暂无用户记录</p>
+                        <p className="text-xs mt-1">Bot 加入房间后会自动记录用户</p>
+                    </div>
+                ) : (
+                    <div className="max-h-72 overflow-y-auto space-y-1 pr-1 scrollbar-thin">
+                        {users.map(u => (
+                            <div key={u.user_id}
+                                className={`flex items-center gap-2.5 p-2 rounded-xl transition-all ${
+                                    u.whitelisted
+                                        ? 'bg-prince-gold/15 border border-prince-gold/30'
+                                        : 'bg-prince-gold/5 border border-transparent hover:border-prince-gold/15'
+                                }`}
+                            >
+                                {u.photo_url ? (
+                                    <img src={u.photo_url} alt="" className="w-8 h-8 rounded-full object-cover border border-prince-gold/20 shrink-0" />
+                                ) : (
+                                    <div className="w-8 h-8 rounded-full bg-prince-gold/10 flex items-center justify-center shrink-0">
+                                        <span className="text-prince-gold/50 text-xs">?</span>
+                                    </div>
+                                )}
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-prince-cream text-sm font-medium truncate">{u.name || 'Unknown'}</div>
+                                    {u.username && <div className="text-prince-muted text-xs truncate">@{u.username}</div>}
+                                </div>
+                                <button
+                                    onClick={() => toggleWhitelist(u.user_id, u.whitelisted)}
+                                    className={`text-xs px-2.5 py-1 rounded-full font-bold transition-all shrink-0 ${
+                                        u.whitelisted
+                                            ? 'bg-prince-gold/20 text-prince-gold hover:bg-prince-rose/20 hover:text-prince-rose'
+                                            : 'bg-prince-gold/10 text-prince-muted hover:bg-prince-gold/20 hover:text-prince-gold'
+                                    }`}
+                                >
+                                    {u.whitelisted ? '✓ 已加白' : '+ 加白名单'}
+                                </button>
+                                <button
+                                    onClick={() => handleManualInvite(u.user_id)}
+                                    title="手动邀请上台"
+                                    className="text-xs w-7 h-7 rounded-full font-bold transition-all shrink-0 bg-blue-500/20 text-blue-400 hover:bg-blue-500/40 flex items-center justify-center"
+                                >
+                                    +
+                                </button>
+                                <button
+                                    onClick={() => handleMakeModerator(u.user_id)}
+                                    title="设为 Moderator"
+                                    className="text-xs w-7 h-7 rounded-full font-bold transition-all shrink-0 bg-green-500/20 text-green-400 hover:bg-green-500/40 flex items-center justify-center"
+                                >
+                                    ✦
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+export { IdentityModal, AddConfirm, WhitelistModal };
