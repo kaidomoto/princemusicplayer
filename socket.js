@@ -46,7 +46,7 @@ module.exports = (io) => {
                 sleepLocked: false,
                 shuffleCooldown: {} // playlistId -> cooldown counter
             });
-            console.log(`📻 Session created: ${sessionId}`);
+            console.log(`🖥️ UI Session created: ${sessionId}`);
         }
         return sessionStates.get(sessionId);
     }

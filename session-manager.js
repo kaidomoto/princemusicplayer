@@ -294,9 +294,11 @@ async function createSession(needsBridge = true) {
                 await new Promise(r => setTimeout(r, 8000));
 
                 // Verify bridge is listening
+                let bridgeVerifiedReady = false;
                 try {
                     const check = await runCmd(`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${bridgePort}/ 2>/dev/null || echo 000`);
                     if (check === '426') {
+                        bridgeVerifiedReady = true;
                         console.log(`  ✅ Bridge verified (HTTP 426 = WebSocket ready)`);
                     } else {
                         console.log(`  ⚠️ Bridge check returned: ${check} (may need more time)`);
@@ -327,7 +329,11 @@ async function createSession(needsBridge = true) {
                 }
 
                 bridgeWsUrl = `/agora-ws-${bridgePort}/`;
-                console.log(`  🔗 Bridge ready: port ${bridgePort}, ws=${bridgeWsUrl}`);
+                if (bridgeVerifiedReady) {
+                    console.log(`  🔗 Bridge ready: port ${bridgePort}, ws=${bridgeWsUrl}`);
+                } else {
+                    console.log(`  🔗 Bridge startup initiated: port ${bridgePort}, ws=${bridgeWsUrl}`);
+                }
             }
         }
 

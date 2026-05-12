@@ -1185,6 +1185,40 @@ app.post('/api/chweb/join', requirePlayerAuth, async (req, res) => {
 // ==================== Unified Broadcast API ====================
 
 // Extract channel slug from Clubhouse URL
+async function resolveChannelSlugFromPage(url, sourceLabel) {
+    try {
+        let fetchUrl = url.trim();
+        if (!fetchUrl.match(/^https?:\/\//i)) fetchUrl = 'https://' + fetchUrl;
+        const resp = await fetch(fetchUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15' },
+            redirect: 'follow'
+        });
+        if (!resp.ok) {
+            console.log(`  ⚠️ extractChannelSlug: ${sourceLabel} page returned HTTP ${resp.status}`);
+            return null;
+        }
+        const html = await resp.text();
+        // Primary source: og:image points to share.clubhouse.com/og/room/CHANNEL[:TOKEN].png
+        const ogMatch = html.match(/share\.clubhouse\.com\/og\/room\/([^.]+)\.png/);
+        if (ogMatch) {
+            const slug = decodeURIComponent(ogMatch[1]);
+            console.log(`  📋 extractChannelSlug (${sourceLabel}→og:image): "${slug}"`);
+            return slug;
+        }
+        // Fallback: explicit channel:token pattern somewhere in page source
+        const ctMatch = html.match(/([A-Za-z0-9]{8,20}:[A-Za-z0-9_-]{20,})/);
+        if (ctMatch) {
+            console.log(`  📋 extractChannelSlug (${sourceLabel}→pattern): "${ctMatch[1]}"`);
+            return ctMatch[1];
+        }
+        console.log(`  ⚠️ extractChannelSlug: ${sourceLabel} page fetched but no canonical channel slug found`);
+        return null;
+    } catch (e) {
+        console.log(`  ⚠️ extractChannelSlug: Failed to fetch ${sourceLabel} page: ${e.message}`);
+        return null;
+    }
+}
+
 async function extractChannelSlug(url) {
     if (!url) return null;
     // URL decode first to handle %3A (colon), %E6... (unicode) etc
@@ -1193,43 +1227,21 @@ async function extractChannelSlug(url) {
     // Handle /room/ links: https://www.clubhouse.com/room/SLUG:TOKEN?...
     const roomMatch = decoded.match(/room\/([^?\s]+)/);
     if (roomMatch) {
-        console.log(`  📋 extractChannelSlug (room): "${roomMatch[1]}"`);
-        return roomMatch[1];
+        const roomSlug = roomMatch[1];
+        console.log(`  📋 extractChannelSlug (room): "${roomSlug}"`);
+        // Old canonical format already contains channel:token and can be used directly.
+        if (roomSlug.includes(':')) return roomSlug;
+        // New short /room/<code> links are not valid join_channel IDs; resolve via page HTML.
+        const resolved = await resolveChannelSlugFromPage(url, 'room');
+        if (resolved) return resolved;
+        console.log(`  ⚠️ extractChannelSlug: /room/ short code "${roomSlug}" could not be resolved`);
+        return null;
     }
     // Handle new /i/ links: https://www.clubhouse.com/i/房间名/shortCode
     const inviteMatch = decoded.match(/clubhouse\.com\/i\/([^/]+)\/([^?\s]+)/);
     if (inviteMatch) {
         console.log(`  📋 extractChannelSlug: New /i/ format detected: room="${inviteMatch[1]}", code="${inviteMatch[2]}"`);
-        try {
-            // Fetch the page HTML to extract channel slug from og:image URL
-            // Format: https://share.clubhouse.com/og/room/CHANNEL:TOKEN.png
-            // Ensure URL has protocol (user may paste "www.clubhouse.com/..." without https://)
-            let fetchUrl = url.trim();
-            if (!fetchUrl.match(/^https?:\/\//i)) fetchUrl = 'https://' + fetchUrl;
-            const resp = await fetch(fetchUrl, {
-                headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15' },
-                redirect: 'follow'
-            });
-            const html = await resp.text();
-            // Extract from og:image: share.clubhouse.com/og/room/SLUG.png
-            const ogMatch = html.match(/share\.clubhouse\.com\/og\/room\/([^.]+)\.png/);
-            if (ogMatch) {
-                const slug = decodeURIComponent(ogMatch[1]);
-                console.log(`  📋 extractChannelSlug (invite→og:image): "${slug}"`);
-                return slug;
-            }
-            // Fallback: look for channel:token pattern anywhere in page
-            const ctMatch = html.match(/([A-Za-z0-9]{8,20}:[A-Za-z0-9_-]{20,})/);
-            if (ctMatch) {
-                console.log(`  📋 extractChannelSlug (invite→pattern): "${ctMatch[1]}"`);
-                return ctMatch[1];
-            }
-            console.log('  ⚠️ extractChannelSlug: /i/ page fetched but no channel slug found');
-            return null;
-        } catch (e) {
-            console.log(`  ⚠️ extractChannelSlug: Failed to fetch /i/ page: ${e.message}`);
-            return null;
-        }
+        return await resolveChannelSlugFromPage(url, 'invite');
     }
     // Handle /house/ links - these are Club links, not room links
     const houseMatch = decoded.match(/house\/([^?\s]+)/);
@@ -1252,6 +1264,14 @@ app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
     }
 
     try {
+        let requestedChannel = null;
+        if (mode === 'join-room') {
+            requestedChannel = await extractChannelSlug(roomUrl);
+            if (!requestedChannel) {
+                return res.status(400).json({ error: '无法从房间链接解析真实房间 ID。请粘贴有效的 Clubhouse 房间分享链接。' });
+            }
+        }
+
         // 0. Auto-replace: stop existing session for same account to prevent duplicates
         try {
             const _raw = sessionMgr.listSessions();
@@ -1320,12 +1340,7 @@ app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
             }
         } else if (mode === 'join-room') {
             // 2b. Join existing room
-            const channel = await extractChannelSlug(roomUrl);
-            if (!channel) {
-                // Cleanup session on failure
-                await sessionMgr.deleteSession(session.sessionId);
-                return res.status(400).json({ error: '请粘贴房间分享链接 (/room/ 链接)，而不是 House/Club 链接 (/house/ 链接)' });
-            }
+            const channel = requestedChannel;
             try {
                 // First try chweb API (only for main account — chweb JWT belongs to main)
                 let data;
@@ -1385,7 +1400,7 @@ app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
                     }
                     // Store channel + roomInfo in session for auto-leave and Broadcast UI
                     if (session && session.sessionId) {
-                        sessionMgr.setSessionChannel(session.sessionId, channel);
+                        sessionMgr.setSessionChannel(session.sessionId, roomInfo.channel || channel);
                         sessionMgr.setSessionMeta(session.sessionId, 'roomInfo', roomInfo);
                     }
                     // Auto-start server-side keepalive for joined room
@@ -1415,6 +1430,16 @@ app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
             }
         }
 
+        if (mode !== 'player-only' && (!roomInfo || roomInfo.error || !roomInfo.channel || !roomInfo.token)) {
+            const failureReason = roomInfo?.error || (mode === 'join-room' ? '加入房间失败' : '创建房间失败');
+            try {
+                await sessionMgr.deleteSession(session.sessionId);
+            } catch (cleanupErr) {
+                console.log(`  ⚠️ Cleanup after ${mode} failure failed: ${cleanupErr.message}`);
+            }
+            return res.status(400).json({ error: failureReason });
+        }
+
         // === Server-side Bridge Join: connect bridge to Agora (fire-and-forget) ===
         // Bridge keeps Agora connection alive even after WS closes, so we just need
         // to send join+unmute once and then disconnect. No persistent WS needed!
@@ -1426,19 +1451,42 @@ app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
             const _aid = roomInfo.agoraInfo?.app_id || '938de3e8055e42b281bb8c6f69c21f78';
             const _sid = session.sessionId;
             const _sm = require('./session-manager');
+            const _waitForBridgeReady = async (port, maxWaitMs = 150000, intervalMs = 2000) => {
+                const start = Date.now();
+                let logged = false;
+                while (Date.now() - start < maxWaitMs) {
+                    try {
+                        const check = require('child_process').execSync(
+                            `curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:${port}/ 2>/dev/null || echo 000`,
+                            { encoding: 'utf8', timeout: 2000 }
+                        ).trim();
+                        if (check === '426') {
+                            console.log(`[Bridge] Ready on port ${port} after ${Math.round((Date.now() - start) / 1000)}s`);
+                            return port;
+                        }
+                        if (!logged) {
+                            console.log(`[Bridge] Waiting for port ${port} to become ready (HTTP ${check})...`);
+                            logged = true;
+                        }
+                    } catch (_) {}
+                    await new Promise(r => setTimeout(r, intervalMs));
+                }
+                return null;
+            };
 
-            function sendBridgeCommand() {
+            function sendBridgeCommand(port) {
                 // Check session still alive
                 try {
                     const sessions = _sm.listSessions ? _sm.listSessions() : [];
                     if (!sessions.some(s => s.sessionId === _sid)) {
                         console.log('[Bridge] Session ' + _sid.slice(0,8) + ' ended, aborting');
+                        _bridgeOpInProgress = false;
                         return;
                     }
                 } catch(_) {}
 
                 const WebSocket = require('ws');
-                const ws = new WebSocket('ws://127.0.0.1:' + _bp);
+                const ws = new WebSocket('ws://127.0.0.1:' + port);
 
                 ws.on('open', () => {
                     // Send leave first (clean up any existing Agora session)
@@ -1480,44 +1528,29 @@ app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
 
                 ws.on('error', (e) => {
                     console.log('[Bridge] WS error: ' + (e.message || 'unknown'));
+                    _bridgeOpInProgress = false;
                 });
-                ws.on('close', () => {}); // Expected - we close intentionally
+                ws.on('close', () => { _bridgeOpInProgress = false; }); // Expected - we close intentionally
             }
 
-            // Wait for bridge to be ready (Wine/Electron startup)
+            // Suppress watchdog while a new bridge is still cold-starting.
+            _bridgeOpInProgress = true;
+            _bridgeLastRestartTime = Date.now();
             setTimeout(async () => {
-                const WebSocket = require('ws');
-                const MAX = 8, DELAY = 3000;
-                for (let i = 1; i <= MAX; i++) {
-                    try {
-                        const sessions = _sm.listSessions ? _sm.listSessions() : [];
-                        if (!sessions.some(s => s.sessionId === _sid)) return;
-                    } catch(_) {}
-                    const ok = await new Promise(resolve => {
-                        const ws = new WebSocket('ws://127.0.0.1:' + _bp);
-                        const to = setTimeout(() => { try{ws.close();}catch(_){} resolve(false); }, 3000);
-                        ws.on('open', () => { clearTimeout(to); ws.close(); resolve(true); });
-                        ws.on('error', () => { clearTimeout(to); resolve(false); });
-                    });
-                    if (ok) { sendBridgeCommand(); return; }
-                    if (i < MAX) {
-                        console.log('[Bridge] Not ready (' + i + '/' + MAX + '), retry...');
-                        await new Promise(r => setTimeout(r, DELAY));
+                try {
+                    const activePort = await _waitForBridgeReady(_bp);
+                    if (!activePort) {
+                        console.log(`[Bridge] Port ${_bp} never became ready within startup window`);
+                        _bridgeOpInProgress = false;
+                        return;
                     }
+                    sendBridgeCommand(activePort);
+                } catch (e) {
+                    console.log('[Bridge] Join bootstrap failed: ' + e.message);
+                    _bridgeOpInProgress = false;
                 }
-                console.log('[Bridge] Not reachable after ' + MAX + ' retries, attempting join with retries...');
-                // Retry sendBridgeCommand up to 3 times with 5s delay
-                let bridgeRetry = 0;
-                const tryBridge = () => {
-                    bridgeRetry++;
-                    console.log('[Bridge] Join attempt ' + bridgeRetry + '/3...');
-                    sendBridgeCommand();
-                    if (bridgeRetry < 3) {
-                        setTimeout(tryBridge, 5000);
-                    }
-                };
-                tryBridge();
-            }, 10000);
+            }, 3000);
+            setTimeout(() => { _bridgeOpInProgress = false; }, 180000);
         }
 
         // === Auto Pin Link: add session remote link to room ===
@@ -3053,10 +3086,11 @@ app.post('/api/clubhouse/force_leave', requirePlayerAuth, async (req, res) => {
     const fkaKey = channel ? channel + ':' + (accountId || 'main') : null;
     const fkey = fkaKey && activeSessions.has(fkaKey) ? fkaKey : (channel && activeSessions.has(channel) ? channel : null);
     if (fkey) {
-        const session = activeSessions.get(fkey);
-        clearInterval(session.pingInterval);
-        clearInterval(session.pollInterval);
+        const kaSession = activeSessions.get(fkey);
+        clearInterval(kaSession.pingInterval);
+        clearInterval(kaSession.pollInterval);
         activeSessions.delete(fkey);
+        saveKeepaliveState();
         results.keepalive = true;
         console.log(`🔌 [Force Leave] Keepalive stopped for ${fkey}`);
     }
@@ -3088,12 +3122,16 @@ app.post('/api/clubhouse/force_leave', requirePlayerAuth, async (req, res) => {
     // 3. Stop broadcast session if sessionId provided
     if (sessionId) {
         try {
-            // Kill the chromium process for this session
-            const { execSync } = require('child_process');
-            execSync(`pkill -f "session_${sessionId}" 2>/dev/null || true`);
-            results.broadcast = true;
-            console.log(`🔌 [Force Leave] Broadcast session ${sessionId} killed`);
-        } catch (e) { /* ignore */ }
+            const result = await sessionMgr.deleteSession(sessionId);
+            if (!result?.error) {
+                results.broadcast = true;
+                console.log(`🔌 [Force Leave] Broadcast session ${sessionId} deleted`);
+            } else {
+                console.log(`⚠️ [Force Leave] deleteSession failed for ${sessionId}: ${result.error}`);
+            }
+        } catch (e) {
+            console.log(`⚠️ [Force Leave] Broadcast delete failed: ${e.message}`);
+        }
     }
     
     console.log(`🔌 [Force Leave] Results:`, results);

@@ -27,6 +27,7 @@ function Broadcast() {
     const [roomNotification, setRoomNotification] = useState(null);
     const [pubnubConnected, setPubnubConnected] = useState(false);
     const [pubnubEnabled, setPubnubEnabled] = useState(true);
+    const sessionFetchErrorLoggedRef = useRef(false);
     // Helper to update a specific room in the Map
     const updateRoom = (sessionId, updates) => {
         setActiveRooms(prev => {
@@ -77,7 +78,9 @@ function Broadcast() {
     useEffect(() => {
         async function fetchAccounts() {
             try {
-                const res = await fetch('/api/clubhouse/accounts');
+                const res = await fetch('/api/clubhouse/accounts', {
+                    headers: { 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
+                });
                 const data = await res.json();
                 setChAccounts(data.accounts || {});
                 if (data.default) setSelectedAccount(data.default);
@@ -91,7 +94,7 @@ function Broadcast() {
         async function fetchAutokick() {
             try {
                 const res = await fetch('/api/autokick/config', {
-                    headers: { 'x-auth-token': sessionStorage.getItem('broadcast-token') || '' },
+                    headers: { 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
                 });
                 if (res.ok) {
                     const data = await res.json();
@@ -109,7 +112,7 @@ function Broadcast() {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'x-auth-token': sessionStorage.getItem('broadcast-token') || '',
+                    'x-auth-token': sessionStorage.getItem('auth_player') || '',
                 },
                 body: JSON.stringify({ enabled: !autokickEnabled }),
             });
@@ -229,8 +232,42 @@ function Broadcast() {
             const res = await fetch('/api/sessions');
             const data = await res.json();
             setBroadcastSessions(data.sessions || []);
-            // Auto-create room cards for sessions not in activeRooms
             const sessions = data.sessions || [];
+            // Reconcile room cards with actual server sessions:
+            // - remove stale cards that no longer exist server-side
+            // - drop old pre-reconnect cards for the same account/channel
+            setActiveRooms(prev => {
+                const next = new Map(prev);
+                for (const [sid, room] of next.entries()) {
+                    const match = sessions.find(s =>
+                        s.sessionId === sid ||
+                        (((s.accountId || 'main') === (room.accountId || 'main')) && s.channel && s.channel === room.channel)
+                    );
+                    // No matching live session at all -> remove stale card
+                    if (!match) {
+                        if (room.timerRef) clearInterval(room.timerRef);
+                        if (room.pingRef) clearInterval(room.pingRef);
+                        if (room.refreshRef) clearInterval(room.refreshRef);
+                        if (room.wsPingInterval) clearInterval(room.wsPingInterval);
+                        if (room.wsRef) try { room.wsRef.close(); } catch {}
+                        next.delete(sid);
+                        continue;
+                    }
+                    // Same room/account but old sessionId -> drop the stale pre-reconnect card
+                    if (match.sessionId !== sid) {
+                        if (room.timerRef) clearInterval(room.timerRef);
+                        if (room.pingRef) clearInterval(room.pingRef);
+                        if (room.refreshRef) clearInterval(room.refreshRef);
+                        if (room.wsPingInterval) clearInterval(room.wsPingInterval);
+                        if (room.wsRef) try { room.wsRef.close(); } catch {}
+                        next.delete(sid);
+                    }
+                }
+                activeRoomsRef.current = next;
+                return next;
+            });
+
+            // Auto-create room cards for sessions not in activeRooms
             for (const s of sessions) {
                 if (s.channel && !activeRoomsRef.current.has(s.sessionId)) {
                     const roomEntry = {
@@ -366,7 +403,7 @@ function Broadcast() {
                     addLog(`🔊 自动连接 Bridge (port ${data.session?.bridgePort})...`);
                     setRoomInput(data.room.channel);
                     // connectAgoraWs removed: server handles bridge join+unmute via fire-and-forget
-                    startKeepalive(data.room.channel, acctId);
+                    // and auto-starts keepalive on successful join/create.
                 }
             }
         } catch (e) { setBroadcastError(e.message); }
@@ -392,10 +429,15 @@ function Broadcast() {
             const resp = await fetch('/api/clubhouse/force_leave', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'x-auth-token': token },
-                body: JSON.stringify({ sessionId, channel, accountId: acctId || selectedAccount }),
+                body: JSON.stringify({ sessionId, channel, accountId: acctId || 'main' }),
             });
             const data = await resp.json();
+            if (!resp.ok || data.success === false) {
+                addLog(`❌ 强制下线失败: ${data.error || data.error_message || `HTTP ${resp.status}`}`);
+                return;
+            }
             addLog(`🔌 强制下线: keepalive=${data.results?.keepalive} leave=${data.results?.leave}`);
+            if (sessionId) removeRoom(sessionId);
             fetchBroadcastSessions();
         } catch (e) { addLog(`❌ 强制下线失败: ${e.message}`); }
     }
@@ -411,7 +453,13 @@ function Broadcast() {
             const res = await fetch('/api/sessions', { headers: { 'x-auth-token': sessionStorage.getItem('auth_player') || '' } });
             const data = await res.json();
             setSessions(data.sessions || []);
-        } catch (e) { addLog('Session fetch error: ' + e.message); }
+            sessionFetchErrorLoggedRef.current = false;
+        } catch (e) {
+            if (!sessionFetchErrorLoggedRef.current) {
+                addLog('Session fetch error: ' + e.message);
+                sessionFetchErrorLoggedRef.current = true;
+            }
+        }
     };
 
     const createNewSession = async () => {
@@ -421,7 +469,7 @@ function Broadcast() {
             const data = await res.json();
             if (data.error) { addLog('\u274c ' + data.error); }
             else {
-                addLog('\ud83d\udcfb Session created: ' + data.shortId);
+                addLog('\ud83d\udcfb Broadcast session created: ' + data.shortId);
                 addLog('\ud83d\udd17 ' + data.playerUrl);
             }
             fetchSessions();
@@ -477,29 +525,48 @@ function Broadcast() {
                     const activeSessions = sessData.sessions || [];
 
                     const restoredEntries = {};
+                    const restoredSessionIds = new Set();
                     for (const [sid, rd] of Object.entries(savedData)) {
                         if (!rd.roomInfo || !rd.channel) continue;
-                        // Only restore if a matching active session exists
+                        const savedAccountId = rd.accountId || 'main';
+                        // Only restore if a matching active session exists for the same account.
+                        // If a reconnect created a NEW sessionId for the same room/account, normalize
+                        // the restored card to the current active sessionId instead of reviving the old one.
                         const matchSession = activeSessions.find(s => 
-                            s.channel === rd.channel || s.sessionId === sid
+                            s.sessionId === sid ||
+                            ((s.accountId || 'main') === savedAccountId && s.channel === rd.channel)
                         );
                         if (!matchSession) {
                             addLog(`🗑️ 跳过已失效的房间: ${rd.channel?.slice(0, 8)}...`);
                             continue;
                         }
-                        restoredEntries[sid] = rd;
+                        const restoredSid = matchSession.sessionId;
+                        if (restoredSessionIds.has(restoredSid)) continue;
+                        restoredSessionIds.add(restoredSid);
+
+                        const restoredChannel = matchSession.channel || rd.channel;
+                        const restoredAccountId = matchSession.accountId || savedAccountId;
+                        const restoredAccountLabel = rd.accountLabel || restoredAccountId || 'unknown';
+                        restoredEntries[restoredSid] = {
+                            ...rd,
+                            channel: restoredChannel,
+                            accountId: restoredAccountId,
+                            accountLabel: restoredAccountLabel,
+                            bridgeWsUrl: matchSession.bridgeWsUrl || rd.bridgeWsUrl,
+                            bridgePort: matchSession.bridgePort || rd.bridgePort,
+                        };
                         const joinTime = rd.joinTime || Date.now();
                         const bridgeWsUrl = matchSession.bridgeWsUrl || rd.bridgeWsUrl;
                         const bridgePort = matchSession.bridgePort || rd.bridgePort;
 
-                        addLog(`♻️ 恢复房间: ${rd.channel} (${rd.accountLabel || rd.accountId || 'unknown'})`);
+                        addLog(`♻️ 恢复房间: ${restoredChannel} (${restoredAccountLabel})`);
 
                         // Create room entry in activeRooms Map
                         const roomEntry = {
                             roomInfo: rd.roomInfo,
-                            channel: rd.channel,
-                            accountId: rd.accountId || 'main',
-                            accountLabel: rd.accountLabel || rd.accountId || 'unknown',
+                            channel: restoredChannel,
+                            accountId: restoredAccountId,
+                            accountLabel: restoredAccountLabel,
                             isMuted: true,
                             agoraJoined: false,
                             agoraConnected: false,
@@ -510,7 +577,7 @@ function Broadcast() {
                             bridgePort: bridgePort,
                             joinTime: joinTime,
                             elapsedTime: Math.floor((Date.now() - joinTime) / 1000),
-                            sessionId: sid,
+                            sessionId: restoredSid,
                             timerRef: null,
                             pingRef: null,
                             refreshRef: null,
@@ -520,8 +587,8 @@ function Broadcast() {
                         roomEntry.timerRef = setInterval(() => {
                             setActiveRooms(prev => {
                                 const next = new Map(prev);
-                                const r = next.get(sid);
-                                if (r) next.set(sid, { ...r, elapsedTime: Math.floor((Date.now() - joinTime) / 1000) });
+                                const r = next.get(restoredSid);
+                                if (r) next.set(restoredSid, { ...r, elapsedTime: Math.floor((Date.now() - joinTime) / 1000) });
                                 activeRoomsRef.current = next;
                                 return next;
                             });
@@ -529,7 +596,7 @@ function Broadcast() {
 
                         setActiveRooms(prev => {
                             const next = new Map(prev);
-                            next.set(sid, roomEntry);
+                            next.set(restoredSid, roomEntry);
                             activeRoomsRef.current = next;
                             return next;
                         });
@@ -541,6 +608,11 @@ function Broadcast() {
                         } else {
                             addLog('ℹ️ 无活跃 Bridge（bot 仍在房间）');
                         }
+                    }
+                    if (Object.keys(restoredEntries).length > 0) {
+                        localStorage.setItem(ROOM_STORAGE_KEY, JSON.stringify(restoredEntries));
+                    } else {
+                        localStorage.removeItem(ROOM_STORAGE_KEY);
                     }
                 } catch (e) {
                     console.error('Room restore error:', e);
@@ -793,7 +865,11 @@ function Broadcast() {
     const startKeepalive = async (channel, acctId) => {
         try {
             const res = await fetch(`${CH_API}/start_keepalive`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-auth-token': sessionStorage.getItem('auth_player') || ''
+                },
                 body: JSON.stringify({ channel, accountId: acctId || selectedAccount })
             });
             const data = await res.json();
@@ -804,18 +880,22 @@ function Broadcast() {
                 }
                 addLog(`💓 Keepalive 已启动 (bot: ${data.botUserId})`);
             } else {
-                addLog(`⚠️ Keepalive 启动失败: ${data.error_message}`);
+                addLog(`⚠️ Keepalive 启动失败: ${data.error_message || data.error || `HTTP ${res.status}`}`);
             }
         } catch (e) {
             addLog(`⚠️ Keepalive 请求失败: ${e.message}`);
         }
     };
 
-    const stopKeepalive = async (channel) => {
+    const stopKeepalive = async (channel, acctId) => {
         try {
             await fetch(`${CH_API}/stop_keepalive`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ channel, accountId: selectedAccount })
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-auth-token': sessionStorage.getItem('auth_player') || ''
+                },
+                body: JSON.stringify({ channel, accountId: acctId || selectedAccount })
             });
             setKeepaliveActive(false);
             // Speaker status managed per-room
@@ -872,17 +952,7 @@ function Broadcast() {
         const room = activeRoomsRef.current.get(sessionId);
         if (!room) return;
         addLog(`正在离开房间 ${room.channel}...`);
-        await stopKeepalive(room.channel, room.accountId);
-        if (room.wsRef && room.wsRef.readyState === WebSocket.OPEN) {
-            try { room.wsRef.send(JSON.stringify({ id: requestIdRef.current++, action: 'leave', channel_name: room.channel })); } catch {}
-        }
-        try {
-            await fetch(`${CH_API}/leave`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json', 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
-                body: JSON.stringify({ channel: room.channel, accountId: room.accountId || selectedAccount })
-            });
-        } catch { }
-        removeRoom(sessionId);
+        await handleForceLeave(sessionId, room.channel, room.accountId);
         addLog('👋 已离开房间');
     };
     // Legacy compat: leave first room
