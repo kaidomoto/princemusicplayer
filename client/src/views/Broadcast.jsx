@@ -62,6 +62,8 @@ function Broadcast() {
     const [broadcastError, setBroadcastError] = useState('');
     const [chAccounts, setChAccounts] = useState({});
     const [selectedAccount, setSelectedAccount] = useState('');
+    const [autokickEnabled, setAutokickEnabled] = useState(null);
+    const [autokickLoading, setAutokickLoading] = useState(false);
 
     // Fetch active sessions on mount
     useEffect(() => {
@@ -83,6 +85,45 @@ function Broadcast() {
         }
         fetchAccounts();
     }, []);
+
+    // Fetch autokick enabled state
+    useEffect(() => {
+        async function fetchAutokick() {
+            try {
+                const res = await fetch('/api/autokick/config', {
+                    headers: { 'x-auth-token': sessionStorage.getItem('broadcast-token') || '' },
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    setAutokickEnabled(data.enabled);
+                }
+            } catch (e) { console.error('Fetch autokick:', e); }
+        }
+        fetchAutokick();
+    }, []);
+
+    const toggleAutokick = async () => {
+        setAutokickLoading(true);
+        try {
+            const res = await fetch('/api/autokick/toggle', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-auth-token': sessionStorage.getItem('broadcast-token') || '',
+                },
+                body: JSON.stringify({ enabled: !autokickEnabled }),
+            });
+            const data = await res.json();
+            if (data.success) {
+                setAutokickEnabled(data.enabled);
+                addLog(`🚫 自动踢人已${data.enabled ? '开启' : '关闭'}`);
+            }
+        } catch (e) {
+            addLog('❌ 切换自动踢人失败: ' + e.message);
+        } finally {
+            setAutokickLoading(false);
+        }
+    };
 
     // --- Diagnostic Panel State ---
     const [diagResult, setDiagResult] = React.useState(null);
@@ -1380,6 +1421,27 @@ function Broadcast() {
                         ))}
                     </div>
                 )}
+            </div>
+
+            {/* AutoKick Toggle */}
+            <div className="bg-prince-card/60 backdrop-blur-sm rounded-2xl border border-orange-500/20 p-4">
+                <div className="flex items-center justify-between">
+                    <div>
+                        <span className="font-hand text-sm text-orange-300">🚫 自动踢人</span>
+                        <p className="text-prince-muted text-[10px] mt-0.5">
+                            黑名单 · 关键词 · Web Listener
+                        </p>
+                    </div>
+                    <button
+                        onClick={toggleAutokick}
+                        disabled={autokickLoading || autokickEnabled === null}
+                        className={`relative inline-flex items-center w-12 h-6 rounded-full transition-all duration-300 focus:outline-none disabled:opacity-50
+                            ${autokickEnabled ? 'bg-orange-500' : 'bg-prince-deep border border-prince-gold/20'}`}
+                    >
+                        <span className={`inline-block w-5 h-5 rounded-full shadow transition-transform duration-300
+                            ${autokickEnabled ? 'translate-x-6 bg-white' : 'translate-x-0.5 bg-prince-muted'}`} />
+                    </button>
+                </div>
             </div>
 
             {/* Log Panel */}

@@ -1730,30 +1730,49 @@ app.post('/api/broadcast/reconnect', requirePlayerAuth, async (req, res) => {
             } catch(pe) { console.log('  ⚠️ Reconnect: Pin failed: ' + pe.message); }
         } catch(apiErr) { console.log('  ⚠️ Reconnect API error: ' + apiErr.message); }
 
-        // Bridge connection with retry (wait for bridge to become ready)
-        const _reconnectBridge = (attempt) => {
-            if (attempt > 12) {
-                console.log('  ❌ Reconnect: Bridge not ready after 60s, giving up');
+        // Bridge connection: poll port until it returns 426 (WS-ready), then connect.
+        // Wine cold-start can take 80-120s, so we poll up to 150s instead of 12 blind retries.
+        const _waitForBridgeReady = async (port, maxWaitMs = 150000, intervalMs = 2000) => {
+            const start = Date.now();
+            let logged = false;
+            while (Date.now() - start < maxWaitMs) {
+                try {
+                    const check = require('child_process').execSync(
+                        `curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:${port}/ 2>/dev/null || echo 000`,
+                        { encoding: 'utf8', timeout: 2000 }
+                    ).trim();
+                    if (check === '426') {
+                        console.log(`  ✅ Reconnect: Bridge ready on port ${port} after ${Math.round((Date.now()-start)/1000)}s`);
+                        return port;
+                    }
+                    if (!logged) { console.log(`  ⏳ Reconnect: Waiting for bridge on port ${port} (HTTP ${check})...`); logged = true; }
+                } catch (_) {}
+                await new Promise(r => setTimeout(r, intervalMs));
+            }
+            // Fallback: scan other known bridge ports
+            for (const tryPort of [8767, 8768, 8769]) {
+                if (tryPort === port) continue;
+                try {
+                    const check = require('child_process').execSync(
+                        `curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:${tryPort}/ 2>/dev/null || echo 000`,
+                        { encoding: 'utf8', timeout: 2000 }
+                    ).trim();
+                    if (check === '426') {
+                        console.log(`  🔀 Reconnect: Falling back to alive bridge on port ${tryPort}`);
+                        return tryPort;
+                    }
+                } catch (_) {}
+            }
+            return null;
+        };
+
+        const _reconnectBridge = async () => {
+            const activePort = await _waitForBridgeReady(bridgePort);
+            if (!activePort) {
+                console.log(`  ❌ Reconnect: No bridge ready after 150s on any port, giving up`);
                 _bridgeOpInProgress = false;
                 return;
             }
-            // After 3 failed attempts on the chosen port, scan for any alive bridge as fallback
-            let activePort = bridgePort;
-            if (attempt > 3) {
-                for (const tryPort of [8767, 8768, 8769]) {
-                    try {
-                        const check = require('child_process').execSync(
-                            `curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:${tryPort}/ 2>/dev/null || echo 000`,
-                            { encoding: 'utf8', timeout: 2000 }
-                        ).trim();
-                        if (check === '426') { activePort = tryPort; break; }
-                    } catch (_) {}
-                }
-                if (activePort !== bridgePort) {
-                    console.log(`  🔀 Reconnect: Switching to alive bridge on port ${activePort} (port ${bridgePort} dead)`);
-                }
-            }
-            console.log(`  🔄 Reconnect: Bridge attempt ${attempt}/12 on port ${activePort}...`);
             const WebSocket = require('ws');
             const ws = new WebSocket('ws://127.0.0.1:' + activePort);
             ws.on('open', () => {
@@ -1773,17 +1792,21 @@ app.post('/api/broadcast/reconnect', requirePlayerAuth, async (req, res) => {
                         ws.send(JSON.stringify({ action: 'unmute' }));
                         console.log('[Bridge] Reconnect: Unmute sent (mic open)');
                         ws.close();
-                        _bridgeOpInProgress = false; // Release lock on success
+                        _bridgeOpInProgress = false;
                     }
                 }, 2500);
             });
-            ws.on('error', () => { setTimeout(() => _reconnectBridge(attempt + 1), 5000); });
+            ws.on('error', (e) => {
+                console.log(`  ❌ Reconnect: WS error after bridge was ready: ${e.message}`);
+                _bridgeOpInProgress = false;
+            });
         };
         _bridgeOpInProgress = true;
-        _bridgeLastRestartTime = Date.now(); // Also set cooldown for watchdog
-        setTimeout(() => _reconnectBridge(1), 10000); // Start after 10s
-        // Safety release after max retry time (12 * 5s + 10s + margin = 90s)
-        setTimeout(() => { _bridgeOpInProgress = false; }, 90000);
+        _bridgeLastRestartTime = Date.now();
+        // Brief 3s grace for createSession to settle, then start polling
+        setTimeout(() => { _reconnectBridge().catch(e => { console.log('Reconnect bridge fatal: ' + e.message); _bridgeOpInProgress = false; }); }, 3000);
+        // Safety release: bridge poll max 150s + WS handshake + margin = 180s
+        setTimeout(() => { _bridgeOpInProgress = false; }, 180000);
 
         // Broadcast session-changed event to all connected clients
         // so Remote pages auto-redirect to the new session
@@ -2522,6 +2545,26 @@ function loadAutokickConfig() {
     try { return JSON.parse(fs.readFileSync(AUTOKICK_CONFIG_FILE, 'utf-8')); }
     catch (_) { return { enabled: false, kickWebListeners: true, keywordBlocklist: [], blacklistIds: [], whitelistIds: [] }; }
 }
+function saveAutokickConfig(cfg) {
+    fs.writeFileSync(AUTOKICK_CONFIG_FILE, JSON.stringify(cfg, null, 2));
+}
+
+// GET /api/autokick/config — return current autokick enabled state
+app.get('/api/autokick/config', requirePlayerAuth, (req, res) => {
+    const cfg = loadAutokickConfig();
+    res.json({ enabled: !!cfg.enabled, kickWebListeners: !!cfg.kickWebListeners });
+});
+
+// POST /api/autokick/toggle — toggle enabled on/off (or set explicitly via body.enabled)
+app.post('/api/autokick/toggle', requirePlayerAuth, (req, res) => {
+    const cfg = loadAutokickConfig();
+    const newEnabled = (req.body && req.body.enabled !== undefined) ? !!req.body.enabled : !cfg.enabled;
+    cfg.enabled = newEnabled;
+    saveAutokickConfig(cfg);
+    console.log(`🚫 [AutoKick] ${newEnabled ? '✅ 已开启' : '⏸️ 已关闭'} (toggled via API)`);
+    res.json({ success: true, enabled: newEnabled });
+});
+
 function loadRoomUsersHistory() {
     try { return JSON.parse(fs.readFileSync(ROOM_USERS_HISTORY_FILE, 'utf-8')); }
     catch (_) { return {}; }
@@ -3312,6 +3355,29 @@ server.listen(PORT, '0.0.0.0', () => {
     }, 30000);
     console.log('🩺 [BridgeWatchdog] Independent bridge watchdog started (30s interval, 90s cooldown)');
 
+    // One-shot zombie ffplay cleanup at startup.
+    // Long-running deployments accumulate ffplay processes stuck in T/Tl (stopped) state
+    // (4+ found in production, oldest from May). They hold PulseAudio sinks in RUNNING state
+    // and leak file descriptors. Safe to kill: stopped processes are not playing audio.
+    try {
+        const { execSync } = require('child_process');
+        // List ffplay processes that are stopped (state starts with T)
+        const out = execSync(`ps -eo pid,stat,cmd | awk '$3 ~ /ffplay/ && $2 ~ /^T/ {print $1}'`,
+            { encoding: 'utf8', timeout: 3000 }).trim();
+        const zombiePids = out ? out.split('\n').filter(Boolean) : [];
+        if (zombiePids.length > 0) {
+            console.log(`🧹 [Cleanup] Found ${zombiePids.length} zombie ffplay process(es): ${zombiePids.join(', ')}`);
+            for (const pid of zombiePids) {
+                try { execSync(`kill -9 ${pid} 2>/dev/null || true`); } catch (_) {}
+            }
+            console.log(`🧹 [Cleanup] Killed ${zombiePids.length} zombie ffplay process(es)`);
+        } else {
+            console.log('🧹 [Cleanup] No zombie ffplay processes found');
+        }
+    } catch (e) {
+        console.log('⚠️ [Cleanup] ffplay zombie scan failed: ' + e.message);
+    }
+
     const savedKA = loadKeepaliveState();
     if (savedKA.length > 0) {
         console.log(`\n🔄 [Keepalive] Restoring ${savedKA.length} keepalive session(s)...`);
@@ -3325,6 +3391,15 @@ server.listen(PORT, '0.0.0.0', () => {
                     });
                     const data = await res.json();
                     console.log(`  ✅ Restored keepalive: ${ka.channel} (${data.success ? 'ok' : data.error_message})`);
+                    // After server restart the Clubhouse state may have reset mute — force unmute regardless of cached state
+                    setTimeout(async () => {
+                        try {
+                            await clubhousePost('update_channel_user_status', { channel: ka.channel, is_muted: false }, ka.accountId === 'main' ? null : ka.accountId);
+                            console.log(`  🔊 [Restore] Force-unmuted ${ka.channel} after restart`);
+                        } catch (ue) {
+                            console.log(`  ⚠️ [Restore] Force-unmute failed for ${ka.channel}: ${ue.message}`);
+                        }
+                    }, 5000);
                 } catch (e) {
                     console.log(`  ❌ Failed to restore keepalive for ${ka.channel}: ${e.message}`);
                 }

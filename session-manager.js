@@ -154,18 +154,23 @@ async function createSession(needsBridge = true) {
                 return { error: 'No free bridge port available' };
             }
 
-            // Kill ALL old start-bridge.sh processes for this port
-            try {
-                await runCmd(`pkill -f 'start-bridge.sh ${bridgePort}' 2>/dev/null || true`);
-                console.log('  🧹 Killed old start-bridge.sh processes for port ' + bridgePort);
-            } catch (_) {}
-
-            // Check if bridge WS server is still running
+            // Check if bridge WS server is already running BEFORE killing anything.
+            // (Previous order was pkill → curl, which killed Wine before checking,
+            // so bridgeAlreadyRunning was always false and reuse path never ran.)
             let bridgeAlreadyRunning = false;
             try {
                 const check = await runCmd(`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${bridgePort}/ 2>/dev/null || echo 000`);
                 bridgeAlreadyRunning = (check === '426');
+                if (bridgeAlreadyRunning) console.log(`  ✅ Bridge alive on port ${bridgePort} (HTTP 426), will attempt reuse`);
             } catch (_) {}
+
+            // Only kill stale wrapper processes when we know we'll start fresh.
+            if (!bridgeAlreadyRunning) {
+                try {
+                    await runCmd(`pkill -f 'start-bridge.sh ${bridgePort}' 2>/dev/null || true`);
+                    console.log('  🧹 Killed old start-bridge.sh processes for port ' + bridgePort);
+                } catch (_) {}
+            }
 
             if (bridgeAlreadyRunning) {
                 // === REUSE existing bridge ===

@@ -2,7 +2,7 @@
   "enabled": true,
   "kickWebListeners": true,
   "keywordBlocklist": [
-    "狗逼", "死全家", "母狗", "prince", "Betty", "操逼", "傻逼"
+    "狗逼", "死全家", "母狗", "操逼", "傻逼"
   ],
   "whitelistIds": [
     1297026092,
