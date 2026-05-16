@@ -4,7 +4,7 @@ import { SocketContext } from '../App';
 import clsx from 'clsx';
 import {
     Play, Pause, SkipBack, SkipForward, Repeat, Repeat1, List,
-    Shuffle, Volume2, VolumeX, Download, Plus, Music2,
+    Shuffle, Volume2, VolumeX, Download, Plus, Music2, Upload,
     Mic, ChevronDown, ChevronUp, Lock, Unlock
 } from 'lucide-react';
 import LyricViewer from '../components/LyricViewer';
@@ -37,6 +37,8 @@ export default function Remote() {
     const [downloading, setDownloading] = useState(false);
     const [downloadProgress, setDownloadProgress] = useState(null);
     const [parsedSongs, setParsedSongs] = useState([]);
+    const [uploadingLocal, setUploadingLocal] = useState(false);
+    const uploadInputRef = useRef(null);
     const [showPlaylistModal, setShowPlaylistModal] = useState(false);
     const [urlToAdd, setUrlToAdd] = useState(null);
     const [showCookieInput, setShowCookieInput] = useState(false);
@@ -414,6 +416,39 @@ export default function Remote() {
         } catch (e) { alert('保存失败'); }
     };
 
+    const handleLocalTrackUpload = async (e) => {
+        const file = e.target.files?.[0];
+        e.target.value = '';
+        if (!file) return;
+        if (!selectedPlaylistId) {
+            alert('请先选择一个播放列表（下方横向列表）');
+            return;
+        }
+        const token = sessionStorage.getItem('auth_player');
+        if (!token) {
+            alert('需要 Player 登录：请点击 🎵 Player 输入密码后再试');
+            return;
+        }
+        setUploadingLocal(true);
+        try {
+            const fd = new FormData();
+            fd.append('file', file);
+            fd.append('playlistId', selectedPlaylistId);
+            const base = (window.location.pathname.replace(/\/$/, '')) || '';
+            const res = await fetch(base + '/api/upload/track', {
+                method: 'POST',
+                headers: { 'x-auth-token': token },
+                body: fd
+            });
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(d.error || '上传失败');
+        } catch (err) {
+            alert(err.message || '上传失败');
+        } finally {
+            setUploadingLocal(false);
+        }
+    };
+
     return (
         <div className="flex flex-col h-full overflow-x-hidden overflow-y-auto scroll-allowed relative">
             {/* All content scrollable */}
@@ -549,6 +584,28 @@ export default function Remote() {
                     className="w-full btn-prince flex justify-center items-center gap-2 py-1.5 text-xs font-hand text-base"
                 >
                     <Download size={14} /> 从星空中采集音乐 ✨
+                </button>
+
+                <input
+                    ref={uploadInputRef}
+                    type="file"
+                    accept=".mp3,.m4a,.aac,.ogg,.opus,.wav,.flac,audio/*"
+                    className="hidden"
+                    onChange={handleLocalTrackUpload}
+                />
+                <button
+                    type="button"
+                    disabled={uploadingLocal}
+                    onClick={() => {
+                        if (!selectedPlaylistId) {
+                            alert('请先选择一个播放列表（下方横向列表）');
+                            return;
+                        }
+                        uploadInputRef.current?.click();
+                    }}
+                    className="w-full btn-prince flex justify-center items-center gap-2 py-1.5 text-xs font-hand border border-prince-gold/20 opacity-100"
+                >
+                    <Upload size={14} /> {uploadingLocal ? '上传中…' : '本地上传到当前播放列表 📂'}
                 </button>
 
                 {/* Downloader Area */}

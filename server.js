@@ -1015,6 +1015,64 @@ function requirePlayerAuth(req, res, next) {
     next();
 }
 
+// Local audio upload → storage/ + append song (same shape as yt-dlp download)
+const AUDIO_UPLOAD_EXT = new Set(['.mp3', '.m4a', '.aac', '.ogg', '.opus', '.wav', '.flac']);
+const uploadTrackAudio = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => {
+            const dir = path.join(__dirname, 'storage');
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            cb(null, dir);
+        },
+        filename: (req, file, cb) => {
+            const ext = path.extname(file.originalname || '').toLowerCase();
+            cb(null, `${Date.now()}${ext || '.mp3'}`);
+        }
+    }),
+    limits: { fileSize: 100 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname || '').toLowerCase();
+        if (!AUDIO_UPLOAD_EXT.has(ext)) {
+            return cb(new Error('不支持的音频格式（仅 mp3/m4a/aac/ogg/opus/wav/flac）'));
+        }
+        cb(null, true);
+    }
+});
+
+app.post('/api/upload/track', requirePlayerAuth, (req, res) => {
+    uploadTrackAudio.single('file')(req, res, (err) => {
+        if (err) {
+            if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({ error: '文件过大（最大 100MB）' });
+            }
+            return res.status(400).json({ error: err.message || '上传失败' });
+        }
+        if (!req.file) return res.status(400).json({ error: '未选择文件' });
+        const playlistId = req.body.playlistId;
+        if (!playlistId) {
+            try { fs.unlinkSync(req.file.path); } catch (_) {}
+            return res.status(400).json({ error: '缺少 playlistId' });
+        }
+        const songId = path.parse(req.file.filename).name;
+        const dispTitle = (req.body.title && String(req.body.title).trim())
+            || path.parse(req.file.originalname || 'track').name
+            || `Song ${songId}`;
+        const filename = req.file.filename;
+        const { playlists, songs } = loadData();
+        songs.push({
+            id: songId,
+            title: dispTitle,
+            url: `/storage/${filename}`,
+            playlistId,
+            hidden: false
+        });
+        saveData(null, songs);
+        io.emit('data_update', { playlists, songs });
+        console.log(`[Upload] track ${songId} "${dispTitle.slice(0, 40)}" → playlist ${playlistId}`);
+        res.json({ success: true, id: songId, title: dispTitle, url: `/storage/${filename}` });
+    });
+});
+
 
 // Sync playlists from production
 app.post('/api/sync-playlists', requirePlayerAuth, (req, res) => {

@@ -1,6 +1,9 @@
 const { exec, spawn } = require('child_process');
+const util = require('util');
 const path = require('path');
 const fs = require('fs');
+
+const execPromise = util.promisify(exec);
 
 const MAX_SESSIONS = 3;
 const SITE_URL = 'https://clubhouses.party/';
@@ -23,6 +26,11 @@ let ioBroadcastCallback = null;
 function setOnTrackEndHook(fn) { onTrackEndHook = fn; }
 function setOnAutoNextCallback(fn) { onAutoNextCallback = fn; }
 function setIOBroadcast(fn) { ioBroadcastCallback = fn; }
+
+/** Non-blocking shell for pkill etc. — never blocks the Node event loop (pause/play/resume). */
+function shellAsync(cmd, timeoutMs = 3000) {
+    exec(cmd, { timeout: timeoutMs }, () => {});
+}
 
 function getFreeBridgePort() {
     const { execSync } = require('child_process');
@@ -553,12 +561,9 @@ async function playTrack(sessionId, url) {
         try { process.kill(-session.ffplayProc.pid, 'SIGKILL'); } catch (_) {}
         session.ffplayProc = null;
     }
-    // Also kill any orphan ffplay processes for this sink (sudo spawn can leave orphans)
+    // Also kill any orphan ffplay processes for this sink (must finish before spawning new ffplay)
     try {
-        require('child_process').execSync(
-            `pkill -9 -f "play-audio.sh ${session.sinkName}" 2>/dev/null || true`,
-            { timeout: 3000 }
-        );
+        await execPromise(`pkill -9 -f "play-audio.sh ${session.sinkName}" 2>/dev/null || true`, { timeout: 3000 });
     } catch (_) {}
     stopProgressTimer(session);
     
@@ -679,13 +684,8 @@ function pauseTrack(sessionId) {
     if (session.ffplayProc) {
         try {
             try { process.kill(-session.ffplayProc.pid, 'SIGSTOP'); } catch (_) {}
-            // Also target ffplay for this session's sink in case it escaped the process group
-            try {
-                require('child_process').execSync(
-                    `pkill -STOP -f "play-audio.sh ${session.sinkName}" 2>/dev/null || true`,
-                    { timeout: 3000 }
-                );
-            } catch (_) {}
+            // Also target ffplay for this session's sink in case it escaped the process group (async — no event-loop block)
+            shellAsync(`pkill -STOP -f "play-audio.sh ${session.sinkName}" 2>/dev/null || true`);
         } catch (_) {}
     }
 }
@@ -714,12 +714,7 @@ function resumeTrack(sessionId) {
     if (session.ffplayProc) {
         try {
             try { process.kill(-session.ffplayProc.pid, 'SIGCONT'); } catch (_) {}
-            try {
-                require('child_process').execSync(
-                    `pkill -CONT -f "play-audio.sh ${session.sinkName}" 2>/dev/null || true`,
-                    { timeout: 3000 }
-                );
-            } catch (_) {}
+            shellAsync(`pkill -CONT -f "play-audio.sh ${session.sinkName}" 2>/dev/null || true`);
         } catch (_) {}
     }
 }
