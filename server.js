@@ -3511,12 +3511,8 @@ server.listen(PORT, '0.0.0.0', () => {
 
     // Auto-next callback: when ffplay finishes a song and skipTrack picks the next one,
     // emit state_update to the correct session room so Remote UI shows the right track name
-    // Server-driven playback: push progress to session rooms
+    // Server-driven playback: push progress to session rooms (no console spam here)
 sessionMgr.setIOBroadcast((sessionId, eventType, data) => {
-    if (eventType === 'state_update') {
-        const summary = JSON.stringify(data).slice(0, 120);
-        console.log(`📤 [IOBroadcast] → session:${sessionId?.slice(0,8)} | ${summary}`);
-    }
     io.to(`session:${sessionId}`).emit(eventType, data);
     // Keep socket.js playerState in sync so new clients get current progress
     if (eventType === 'state_update' && sessionManager.updatePlayerState) {
