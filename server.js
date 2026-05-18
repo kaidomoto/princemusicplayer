@@ -1314,9 +1314,9 @@ async function extractChannelSlug(url) {
 }
 
 // POST /api/broadcast/start
-// body: { mode: "player-only" | "create-room" | "join-room", roomUrl?: string, topic?: string }
+// body: { mode, roomUrl?, topic?, accountId?, clubId? (legacy club), socialClubId? (House / social club string) }
 app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
-    const { mode, roomUrl, topic, accountId } = req.body;
+    const { mode, roomUrl, topic, accountId, clubId, socialClubId } = req.body;
     if (!['player-only', 'create-room', 'join-room'].includes(mode)) {
         return res.status(400).json({ error: 'Invalid mode. Use: player-only, create-room, join-room' });
     }
@@ -1359,12 +1359,24 @@ app.post('/api/broadcast/start', requirePlayerAuth, async (req, res) => {
             // 2a. Create Clubhouse room
             try {
                 const roomTopic = topic || '🎵 Music Studio';
-                const data = await clubhousePost('create_channel', {
+                const createPayload = {
                     topic: roomTopic,
                     privacy_level: 'public',
                     is_social_mode: false,
                     is_replay_enabled: false,
-                }, accountId);
+                };
+                const scStr = socialClubId != null && String(socialClubId).trim() !== '' ? String(socialClubId).trim() : '';
+                if (scStr && /^\d+$/.test(scStr)) {
+                    createPayload.social_club_id = scStr;
+                    console.log(`  🏠 create_channel with social_club_id=${scStr}`);
+                } else {
+                    const parsedClub = parseInt(String(clubId ?? ''), 10);
+                    if (Number.isFinite(parsedClub) && parsedClub > 0) {
+                        createPayload.club_id = parsedClub;
+                        console.log(`  🏠 create_channel with club_id=${parsedClub}`);
+                    }
+                }
+                const data = await clubhousePost('create_channel', createPayload, accountId);
                 if (data.success !== false) {
                     const createAccount = getAccount(accountId);
                     roomInfo = {
@@ -1666,16 +1678,29 @@ app.post('/api/broadcast/mute', requirePlayerAuth, async (req, res) => {
     
     const action = muted ? 'mute' : 'unmute';
     const roomInfo = session.roomInfo || {};
-    // Track manual mute state so poll won't auto-unmute when manually muted
     const sessionChannel = session.channel || roomInfo.channel;
-    if (sessionChannel) channelMuteOverride.set(sessionChannel, !!muted);
-    
+
+    const net = require('net');
+    const portReachable = await new Promise((resolve) => {
+        const sock = net.connect(session.bridgePort, '127.0.0.1', () => { try { sock.destroy(); } catch (_) {} resolve(true); });
+        sock.on('error', () => resolve(false));
+        sock.setTimeout(2000, () => { try { sock.destroy(); } catch (_) {} resolve(false); });
+    });
+    if (!portReachable) {
+        console.log(`[Mute API] bridge port ${session.bridgePort} unreachable for session ${sessionId.slice(0, 8)}`);
+        return res.status(503).json({
+            success: false,
+            error: '本机 Agora Bridge 未在该端口监听（进程未启动或 Wine 尚未就绪）。请稍等自动恢复，或使用广播页的「重连」。',
+            code: 'BRIDGE_DOWN'
+        });
+    }
+
     try {
         const WebSocket = require('ws');
         const result = await new Promise((resolve, reject) => {
             const ws = new WebSocket('ws://127.0.0.1:' + session.bridgePort);
-            const timeout = setTimeout(() => { try{ws.close();}catch(_){} reject(new Error('timeout')); }, 5000);
-            
+            const timeout = setTimeout(() => { try { ws.close(); } catch (_) {} reject(new Error('timeout')); }, 8000);
+
             ws.on('open', () => {
                 // Must send join first (sets bridge's this.joined=true)
                 if (roomInfo.token) {
@@ -1692,9 +1717,10 @@ app.post('/api/broadcast/mute', requirePlayerAuth, async (req, res) => {
                         // Send mute/unmute after join
                         setTimeout(() => {
                             ws.send(JSON.stringify({ action }));
-                            console.log('[Mute API] ' + action + ' sent for session ' + sessionId.slice(0,8));
+                            console.log('[Mute API] ' + action + ' sent for session ' + sessionId.slice(0, 8));
                             clearTimeout(timeout);
-                            setTimeout(() => { try{ws.close();}catch(_){} }, 300);
+                            setTimeout(() => { try { ws.close(); } catch (_) {} }, 300);
+                            if (sessionChannel) channelMuteOverride.set(sessionChannel, !!muted);
                             resolve({ success: true, action });
                         }, 800);
                     }, 300);
@@ -1702,7 +1728,8 @@ app.post('/api/broadcast/mute', requirePlayerAuth, async (req, res) => {
                     // No token — try unmute directly (may fail if bridge not joined)
                     ws.send(JSON.stringify({ action }));
                     clearTimeout(timeout);
-                    setTimeout(() => { try{ws.close();}catch(_){} }, 300);
+                    setTimeout(() => { try { ws.close(); } catch (_) {} }, 300);
+                    if (sessionChannel) channelMuteOverride.set(sessionChannel, !!muted);
                     resolve({ success: true, action, warning: 'no token, direct send' });
                 }
             });
@@ -1710,7 +1737,18 @@ app.post('/api/broadcast/mute', requirePlayerAuth, async (req, res) => {
         });
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        const msg = e && e.message ? String(e.message) : String(e);
+        const down = /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|timeout/i.test(msg);
+        console.log(`[Mute API] failed: ${msg}`);
+        if (down) {
+            return res.status(503).json({
+                success: false,
+                error: '无法连接本机 Bridge（可能刚重启）。请稍后重试或使用「重连」。',
+                code: 'BRIDGE_DOWN',
+                detail: msg
+            });
+        }
+        res.status(500).json({ success: false, error: msg });
     }
 });
 
@@ -2397,12 +2435,22 @@ app.post('/api/clubhouse/get_channel', requirePlayerAuth, async (req, res) => {
     try {
         const { channel, accountId } = req.body;
         if (!channel) return res.json({ success: false, error_message: 'Missing channel' });
-        const data = await clubhousePost('get_channel', { channel });
+        const data = await clubhousePost('get_channel', { channel }, accountId || null);
         res.json(data);
     } catch (e) {
         // Suppress get_channel error spam (may fail for rooms not created by this token)
         res.json({ success: false, error_message: e.response?.data?.error_message || e.message });
     }
+});
+
+// create-room 下拉：硬编码 Social Club（House）。来自 join_channel/get_channel 反查的 social_club_id（须字符串，避免 JS 大整数精度问题）
+const STATIC_CREATE_ROOM_HOUSES = [
+    { socialClubId: '5117210297323161974', displayLabel: '朝酒晚舞（聊天）' },
+    { socialClubId: '1718288493', displayLabel: '朝酒晚舞（学习）' },
+];
+
+app.post('/api/clubhouse/houses', requirePlayerAuth, (req, res) => {
+    res.json({ success: true, houses: STATIC_CREATE_ROOM_HOUSES });
 });
 
 app.get('/api/clubhouse/token', (req, res) => {
@@ -2531,13 +2579,15 @@ app.post('/api/clubhouse/accept_speaker', requirePlayerAuth, async (req, res) =>
     }
 });
 
-// Invite user to speak (requires moderator)
-app.post('/api/clubhouse/invite_speaker', async (req, res) => {
+// Invite user to speak (requires moderator bot + Player auth)
+app.post('/api/clubhouse/invite_speaker', requirePlayerAuth, async (req, res) => {
     try {
-        const { channel, user_id } = req.body;
-        if (!channel || !user_id) return res.json({ success: false, error_message: 'Missing channel or user_id' });
-        const data = await clubhousePost('invite_speaker', { channel, user_id: parseInt(user_id) });
-        console.log(`📣 Invited user ${user_id} to speak in: ${channel}`);
+        const { channel, user_id, accountId } = req.body;
+        if (!channel || user_id === undefined || user_id === null || user_id === '') {
+            return res.json({ success: false, error_message: 'Missing channel or user_id' });
+        }
+        const data = await clubhousePost('invite_speaker', { channel, user_id: parseInt(user_id, 10) }, accountId || null);
+        console.log(`📣 Invited user ${user_id} to speak in: ${channel} (account=${accountId || 'default'})`);
         res.json(data);
     } catch (e) {
         console.error('[Clubhouse] Invite speaker failed:', e.response?.data || e.message);
@@ -2545,16 +2595,34 @@ app.post('/api/clubhouse/invite_speaker', async (req, res) => {
     }
 });
 
-// Make user a moderator (requires bot to be moderator)
-app.post('/api/clubhouse/make_moderator', async (req, res) => {
+// Make user a moderator (requires bot to be moderator + Player auth)
+app.post('/api/clubhouse/make_moderator', requirePlayerAuth, async (req, res) => {
     try {
-        const { channel, user_id } = req.body;
-        if (!channel || !user_id) return res.json({ success: false, error_message: 'Missing channel or user_id' });
-        const data = await clubhousePost('make_moderator', { channel, user_id: parseInt(user_id) });
-        console.log(`👑 Made user ${user_id} moderator in: ${channel}`);
+        const { channel, user_id, accountId } = req.body;
+        if (!channel || user_id === undefined || user_id === null || user_id === '') {
+            return res.json({ success: false, error_message: 'Missing channel or user_id' });
+        }
+        const data = await clubhousePost('make_moderator', { channel, user_id: parseInt(user_id, 10) }, accountId || null);
+        console.log(`👑 Made user ${user_id} moderator in: ${channel} (account=${accountId || 'default'})`);
         res.json(data);
     } catch (e) {
         console.error('[Clubhouse] Make moderator failed:', e.response?.data || e.message);
+        res.json({ success: false, error_message: e.response?.data?.error_message || e.message });
+    }
+});
+
+// Remove user from channel (block — cannot re-enter per Clubhouse rules) + Player auth
+app.post('/api/clubhouse/block_user', requirePlayerAuth, async (req, res) => {
+    try {
+        const { channel, user_id, accountId } = req.body;
+        if (!channel || user_id === undefined || user_id === null || user_id === '') {
+            return res.json({ success: false, error_message: 'Missing channel or user_id' });
+        }
+        const data = await clubhousePost('block_from_channel', { channel, user_id: parseInt(user_id, 10) }, accountId || null);
+        console.log(`🚫 Blocked user ${user_id} from ${channel} (account=${accountId || 'default'})`);
+        res.json(data);
+    } catch (e) {
+        console.error('[Clubhouse] block_user failed:', e.response?.data || e.message);
         res.json({ success: false, error_message: e.response?.data?.error_message || e.message });
     }
 });

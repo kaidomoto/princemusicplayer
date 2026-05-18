@@ -4,6 +4,12 @@ import PubNub from 'pubnub';
 import { io as socketIO } from 'socket.io-client';
 
 const CH_API = '/api/clubhouse';
+
+/** 与 server.js STATIC_CREATE_ROOM_HOUSES 一致：create_channel 用 social_club_id（字符串，防大整数精度丢失） */
+const STATIC_CREATE_HOUSE_OPTIONS = [
+    { socialClubId: '5117210297323161974', displayLabel: '朝酒晚舞（聊天）' },
+    { socialClubId: '1718288493', displayLabel: '朝酒晚舞（学习）' },
+];
 // Use wss:// via nginx proxy to avoid HTTPS mixed-content block
 const AGORA_WS_URL = `wss://${window.location.host}/agora-ws/`;
 const ROOM_STORAGE_KEY = 'broadcast_room';
@@ -66,6 +72,9 @@ function Broadcast() {
     const [autokickEnabled, setAutokickEnabled] = useState(null);
     const [autokickLoading, setAutokickLoading] = useState(false);
 
+    // Create-room: optional House（social_club_id，与下拉硬编码一致）
+    const [createHouseClubId, setCreateHouseClubId] = useState('');
+
     // Fetch active sessions on mount
     useEffect(() => {
         fetchBroadcastSessions();
@@ -89,12 +98,18 @@ function Broadcast() {
         fetchAccounts();
     }, []);
 
-    // Fetch autokick enabled state
+    // Fetch autokick enabled state (requires Player token — skip if unauthenticated to avoid 401 log spam;
+    // Broadcast stays mounted even on Remote tab, so this runs on every full page load.)
     useEffect(() => {
         async function fetchAutokick() {
+            const token = sessionStorage.getItem('auth_player');
+            if (!token) {
+                setAutokickEnabled(null);
+                return;
+            }
             try {
                 const res = await fetch('/api/autokick/config', {
-                    headers: { 'x-auth-token': sessionStorage.getItem('auth_player') || '' },
+                    headers: { 'x-auth-token': token },
                 });
                 if (res.ok) {
                     const data = await res.json();
@@ -319,6 +334,10 @@ function Broadcast() {
         try {
             const body = { mode };
             if (selectedAccount) body.accountId = selectedAccount;
+            if (mode === 'create-room' && createHouseClubId) {
+                const sid = String(createHouseClubId).trim();
+                if (/^\d+$/.test(sid)) body.socialClubId = sid;
+            }
             if (mode === 'join-room') {
                 if (!joinRoomUrl.trim()) { setBroadcastError('请输入房间链接'); setBroadcastLoading(''); return; }
                 body.roomUrl = joinRoomUrl.trim();
@@ -445,6 +464,100 @@ function Broadcast() {
     const addLog = (msg) => {
         const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         setLogs(prev => [`[${time}] ${msg}`, ...prev].slice(0, 50));
+    };
+
+    const playerAuthHeaders = () => ({
+        'Content-Type': 'application/json',
+        'x-auth-token': sessionStorage.getItem('auth_player') || ''
+    });
+
+    /** Refresh user list for room admin toolbar (uses same bot account as the room). */
+    const loadRoomAdminUsers = async (sessionId) => {
+        const room = activeRoomsRef.current.get(sessionId);
+        if (!room?.channel) return;
+        updateRoom(sessionId, { adminLoading: true, adminError: '' });
+        try {
+            const res = await fetch(`${CH_API}/get_channel`, {
+                method: 'POST',
+                headers: playerAuthHeaders(),
+                body: JSON.stringify({ channel: room.channel, accountId: room.accountId || 'main' })
+            });
+            const data = await res.json();
+            if (res.status === 401) {
+                updateRoom(sessionId, { adminLoading: false, adminError: '需要 Player 登录', adminUsersList: [] });
+                return;
+            }
+            const errMsg = data.error_message || data.error;
+            const users = data.users || [];
+            if (errMsg && users.length === 0) {
+                updateRoom(sessionId, { adminLoading: false, adminError: String(errMsg), adminUsersList: [] });
+                return;
+            }
+            const r2 = activeRoomsRef.current.get(sessionId);
+            updateRoom(sessionId, {
+                adminLoading: false,
+                adminUsersList: users,
+                adminError: '',
+                roomInfo: { ...(r2?.roomInfo || {}), users, topic: data.topic || r2?.roomInfo?.topic }
+            });
+        } catch (e) {
+            updateRoom(sessionId, { adminLoading: false, adminError: e.message, adminUsersList: [] });
+        }
+    };
+
+    const toggleRoomAdminToolbar = async (sessionId) => {
+        const room = activeRoomsRef.current.get(sessionId);
+        if (!room) return;
+        if (room.adminToolbarOpen) {
+            updateRoom(sessionId, { adminToolbarOpen: false });
+            return;
+        }
+        updateRoom(sessionId, { adminToolbarOpen: true, adminSelectedUserId: '' });
+        await loadRoomAdminUsers(sessionId);
+    };
+
+    const roomAdminAction = async (sessionId, action) => {
+        const room = activeRoomsRef.current.get(sessionId);
+        if (!room?.channel) return;
+        const uidRaw = room.adminSelectedUserId;
+        if (uidRaw === undefined || uidRaw === null || uidRaw === '') {
+            addLog('⚠️ 请先在列表中选择一位用户');
+            return;
+        }
+        const uid = parseInt(String(uidRaw), 10);
+        if (Number.isNaN(uid)) {
+            addLog('⚠️ 无效的用户 ID');
+            return;
+        }
+        const accountId = room.accountId || 'main';
+        const body = { channel: room.channel, user_id: uid, accountId };
+        const url = action === 'block'
+            ? `${CH_API}/block_user`
+            : action === 'invite'
+                ? `${CH_API}/invite_speaker`
+                : `${CH_API}/make_moderator`;
+        updateRoom(sessionId, { adminActionLoading: true });
+        try {
+            const res = await fetch(url, { method: 'POST', headers: playerAuthHeaders(), body: JSON.stringify(body) });
+            const data = await res.json();
+            if (res.status === 401) {
+                addLog('❌ 需要 Player 登录');
+                return;
+            }
+            const em = data.error_message || data.error;
+            if (data.success === false || (em && String(em).length > 0)) {
+                addLog(`❌ 操作失败: ${em}（Bot 需为房间管理员）`);
+                return;
+            }
+            if (action === 'block') addLog(`✅ 已移出 ${uid}`);
+            else if (action === 'invite') addLog(`✅ 已邀请上麦 ${uid}`);
+            else addLog(`✅ 已设为 mod ${uid}`);
+            await loadRoomAdminUsers(sessionId);
+        } catch (e) {
+            addLog(`❌ ${e.message}`);
+        } finally {
+            updateRoom(sessionId, { adminActionLoading: false });
+        }
     };
 
     // === Session Management ===
@@ -800,11 +913,12 @@ function Broadcast() {
                 headers: { 'Content-Type': 'application/json', 'x-auth-token': token },
                 body: JSON.stringify({ sessionId, muted: newMuted }),
             });
-            const data = await res.json();
-            if (data.success) {
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.success) {
                 addLog(newMuted ? '🔇 已静音' : '🎙️ 已开麦');
             } else {
-                addLog('❌ ' + (data.error || '操作失败'));
+                const err = data.error || data.detail || `HTTP ${res.status}`;
+                addLog('❌ ' + err);
                 updateRoom(sessionId, { isMuted: !newMuted }); // revert
             }
         } catch (e) {
@@ -1191,6 +1305,24 @@ function Broadcast() {
                         )}
                     </div>
 
+                        {/* House：硬编码 social_club_id（与 server STATIC_CREATE_ROOM_HOUSES 一致） */}
+                        <div className="flex items-center gap-2 mb-1">
+                            <span className="text-xs text-prince-muted/60 font-hand whitespace-nowrap">🏠 创建位置</span>
+                            <select
+                                value={createHouseClubId}
+                                onChange={e => setCreateHouseClubId(e.target.value)}
+                                disabled={!!broadcastLoading}
+                                className="flex-1 px-3 py-1.5 rounded-xl bg-prince-deep/60 border border-prince-gold/20 text-prince-light text-xs font-body outline-none focus:border-prince-gold/40 cursor-pointer disabled:opacity-50"
+                            >
+                                <option value="">公开（不指定 House）</option>
+                                {STATIC_CREATE_HOUSE_OPTIONS.map(h => (
+                                    <option key={h.socialClubId} value={h.socialClubId}>
+                                        {h.displayLabel}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+
                         {/* Create room button */}
                         <button
                             onClick={() => handleBroadcastStart('create-room')}
@@ -1206,7 +1338,10 @@ function Broadcast() {
                                 <span className="text-xs text-prince-muted/60 font-hand whitespace-nowrap">👤 账号:</span>
                                 <select
                                     value={selectedAccount}
-                                    onChange={e => setSelectedAccount(e.target.value)}
+                                    onChange={e => {
+                                        setSelectedAccount(e.target.value);
+                                        setCreateHouseClubId('');
+                                    }}
                                     className="flex-1 px-3 py-1.5 rounded-xl bg-prince-deep/60 border border-prince-gold/20 text-prince-light text-xs font-body outline-none focus:border-prince-gold/40 cursor-pointer"
                                 >
                                     {Object.entries(chAccounts).map(([id, acct]) => (
@@ -1423,8 +1558,8 @@ function Broadcast() {
                             <div className="grid grid-cols-3 gap-2">
                                 <div className="bg-prince-deep/40 rounded-lg p-2 text-center">
                                     <Users className="w-3 h-3 text-prince-gold mx-auto mb-0.5" />
-                                    <span className="text-prince-cream text-sm font-hand block">{room.roomInfo?.users?.length || 0}</span>
-                                    <span className="text-prince-muted text-[9px]">听众</span>
+                                    <span className="text-prince-cream text-sm font-hand block">{room.roomInfo?.users?.length ?? (room.adminUsersList?.length || 0)}</span>
+                                    <span className="text-prince-muted text-[9px]">在房</span>
                                 </div>
                                 <div className="bg-prince-deep/40 rounded-lg p-2 text-center">
                                     <Clock className="w-3 h-3 text-prince-gold mx-auto mb-0.5" />
@@ -1438,6 +1573,61 @@ function Broadcast() {
                                     <span className={`text-[9px] ${room.isMuted ? 'text-red-400' : 'text-green-400'}`}>{room.isMuted ? '静音' : '开麦'}</span>
                                 </div>
                             </div>
+                            <button
+                                type="button"
+                                onClick={() => toggleRoomAdminToolbar(sid)}
+                                className="w-full py-1.5 rounded-lg text-[11px] font-hand border border-prince-gold/25 text-prince-gold/90 hover:bg-prince-gold/10 transition-all"
+                            >
+                                {room.adminToolbarOpen ? '▲ 收起房管工具' : '▼ 房管工具（拉人 / 踢人 / mod）'}
+                            </button>
+                            {room.adminToolbarOpen && (
+                                <div className="rounded-lg border border-prince-gold/20 bg-prince-deep/50 p-2 space-y-2">
+                                    <p className="text-[9px] text-prince-muted leading-snug">
+                                        打开时拉取当前在房用户；操作使用该房的 Bot 账号（需为管理员，否则接口会失败）。
+                                    </p>
+                                    {room.adminLoading && <div className="text-[10px] text-prince-muted">加载成员列表…</div>}
+                                    {room.adminError && <div className="text-[10px] text-red-400">{room.adminError}</div>}
+                                    <select
+                                        className="w-full bg-prince-deep border border-prince-gold/20 rounded-lg px-2 py-1.5 text-[11px] text-prince-cream"
+                                        value={room.adminSelectedUserId === undefined || room.adminSelectedUserId === null ? '' : String(room.adminSelectedUserId)}
+                                        onChange={(e) => updateRoom(sid, { adminSelectedUserId: e.target.value === '' ? '' : e.target.value })}
+                                        disabled={!!room.adminLoading}
+                                    >
+                                        <option value="">选择用户…</option>
+                                        {(room.adminUsersList || []).map((u) => (
+                                            <option key={String(u.user_id)} value={String(u.user_id)}>
+                                                {(u.name || '用户')} ({u.user_id}){u.is_speaker ? ' 🎙' : ''}{u.is_moderator ? ' 👑' : ''}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <div className="flex flex-wrap gap-1.5 justify-center">
+                                        <button
+                                            type="button"
+                                            disabled={!!room.adminActionLoading || !!room.adminLoading}
+                                            onClick={() => roomAdminAction(sid, 'block')}
+                                            className="px-2 py-1 rounded-md text-[10px] bg-red-500/20 text-red-300 border border-red-500/30 hover:bg-red-500/30 disabled:opacity-40"
+                                        >
+                                            移出
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={!!room.adminActionLoading || !!room.adminLoading}
+                                            onClick={() => roomAdminAction(sid, 'invite')}
+                                            className="px-2 py-1 rounded-md text-[10px] bg-emerald-500/20 text-emerald-200 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40"
+                                        >
+                                            拉上台
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={!!room.adminActionLoading || !!room.adminLoading}
+                                            onClick={() => roomAdminAction(sid, 'mod')}
+                                            className="px-2 py-1 rounded-md text-[10px] bg-amber-500/15 text-amber-200 border border-amber-500/30 hover:bg-amber-500/25 disabled:opacity-40"
+                                        >
+                                            设为 mod
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
                             {room.roomInfo?.url && (
                                 <button onClick={() => { navigator.clipboard.writeText(room.roomInfo.url); addLog('📋 房间链接已复制'); }}
                                     className="w-full py-1.5 rounded-lg text-xs font-body text-prince-muted border border-prince-gold/10 hover:border-prince-gold/30 hover:text-prince-gold transition-all flex items-center justify-center gap-1">
